@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────
+# RangeDiffSeg configuration
+# ─────────────────────────────────────────────────────────────
+
+dataset:
+  root:       /path/to/SemanticKITTI      # dataset root directory
+  proj_h:     64                          # range image height (LiDAR scan lines)
+  proj_w:     512                         # range image width  (azimuth bins)
+  train_seqs: ['00','01','02','03','04','05','06','07','09','10']
+  val_seqs:   ['08']
+  test_seqs:  ['11','12','13','14','15','16','17','18','19','20','21']
+
+  # 3-D augmentation probabilities and ranges (training only)
+  augmentation:
+    p_flipx:         0.5
+    p_flipy:         0.5
+    p_transx:        0.5
+    transx_range:    [-5.0, 5.0]
+    p_transy:        0.5
+    transy_range:    [-3.0, 3.0]
+    p_transz:        0.5
+    transz_range:    [-1.0, 0.0]
+    p_rot_yaw:       0.5
+    rot_yaw_range:   [-5.0, 5.0]
+    p_rot_pitch:     0.5
+    rot_pitch_range: [-5.0, 5.0]
+    p_rot_roll:      0.5
+    rot_roll_range:  [-5.0, 5.0]
+    p_scale:         0.5
+    scale_range:     [0.95, 1.05]
+
+# ─────────────────────────────────────────────────────────────
+diffusion:
+  num_timesteps: 100       # T: number of DDPM steps
+  schedule:      cosine    # noise schedule: 'cosine' or 'linear'
+
+# ─────────────────────────────────────────────────────────────
+model:
+  base_ch:        64          # base channel width (must be divisible by 32)
+  ch_mults:       [1, 2, 4, 4]  # per-level channel multipliers
+  num_res_blocks: 2           # residual blocks per encoder/decoder level
+  use_mid_attn:   true        # self-attention at bottleneck
+  dropout:        0.1
+
+# ─────────────────────────────────────────────────────────────
+training:
+  batch_size:   4
+  lr:           2.0e-4
+  weight_decay: 1.0e-4
+  max_steps:    300000
+  save_every:   5000
+  log_every:    100
+  num_workers:  4
+  log_dir:      ./checkpoints
