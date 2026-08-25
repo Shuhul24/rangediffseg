@@ -1,11 +1,18 @@
 # ─────────────────────────────────────────────────────────────
-# RangeDiffSeg configuration
+# RangeDiT configuration
+# Off-the-shelf Diffusion Transformer (DiT) fine-tuned for LiDAR
+# semantic segmentation on range-view images, RangeViT style.
 # ─────────────────────────────────────────────────────────────
 
 dataset:
-  root:       /path/to/SemanticKITTI      # dataset root directory
-  proj_h:     64                          # range image height (LiDAR scan lines)
-  proj_w:     512                         # range image width  (azimuth bins)
+  name:        SemanticKitti
+  root:        /path/to/SemanticKITTI   # dataset root directory  <-- SET THIS
+  n_classes:   20                       # 19 semantic classes + 1 ignore (index 0)
+  in_channels: 5                        # [range, x, y, z, intensity]
+  proj_h:      64                       # range image height (LiDAR scan lines)
+  proj_w:      2048                     # range image width  (azimuth bins)
+  fov_up:      3.0                      # vertical field of view, upper bound (deg)
+  fov_down:    -25.0                    # vertical field of view, lower bound (deg)
   train_seqs: ['00','01','02','03','04','05','06','07','09','10']
   val_seqs:   ['08']
   test_seqs:  ['11','12','13','14','15','16','17','18','19','20','21']
@@ -30,25 +37,69 @@ dataset:
     scale_range:     [0.95, 1.05]
 
 # ─────────────────────────────────────────────────────────────
-diffusion:
-  num_timesteps: 100       # T: number of DDPM steps
-  schedule:      cosine    # noise schedule: 'cosine' or 'linear'
-
-# ─────────────────────────────────────────────────────────────
 model:
-  base_ch:        64          # base channel width (must be divisible by 32)
-  ch_mults:       [1, 2, 4, 4]  # per-level channel multipliers
-  num_res_blocks: 2           # residual blocks per encoder/decoder level
-  use_mid_attn:   true        # self-attention at bottleneck
-  dropout:        0.1
+  # ---- Pre-trained DiT trunk ----
+  backbone:         DiT-XL/2            # only DiT-XL/2 weights were released by Meta
+  pretrained_model: DiT-XL-2-256x256.pt # downloaded on first use, or a local .pt path
+                                        # (set to null to train the trunk from scratch)
+
+  # ---- Stem: patchification, patch encoding, positional embedding ----
+  image_size:         [64, 384]         # random crop the network is trained on
+  patch_size:         [2, 8]            # anisotropic patches, as in RangeViT
+  patch_stride:       [2, 8]
+  conv_stem:          ConvStem          # 'ConvStem' or 'none' (plain patch embedding)
+  stem_base_channels: 32
+  D_h:                256               # hidden dim of the stem and of the decoder
+  reuse_pos_emb:      true              # resize DiT's 16x16 sin-cos grid to 32x48
+  reuse_patch_emb:    false             # only possible with conv_stem: none
+  learnable_pos_emb:  true              # DiT freezes it, RangeViT fine-tunes it
+
+  # ---- Decoder ----
+  decoder:      up_conv                 # 'up_conv' or 'linear'
+  skip_filters: 256                     # stem -> decoder skip connection (0 = off, else = D_h)
+
+  # ---- adaLN-Zero conditioning of the DiT blocks ----
+  # DiT blocks are modulated by c = t_embedder(t) + y_embedder(y). Segmentation
+  # has no timestep and no ImageNet class, so we feed a fixed timestep and the
+  # class-free ("null") label embedding, plus a zero-initialised learnt offset.
+  cond_timestep:  0                     # fixed diffusion timestep fed to t_embedder
+  cond_class:     null                  # null = the class-free embedding row
+  learnable_cond: true                  # learn an offset on top of it
+  cond_mode:      static                # 'static', or 'context' to also condition
+                                        # on the pooled stem features of the scan
+
+  # ---- Which parts of the trunk are trained ----
+  # DiT LayerNorms have elementwise_affine=False, so the counterpart of
+  # RangeViT's `unfreeze_layernorm` is `unfreeze_adaln`.
+  freeze_dit_encoder: true
+  unfreeze_adaln:     true
+  adaln_bias_only:    true              # train only the modulation bias: with a
+                                        # static conditioning vector it is just as
+                                        # expressive, for 1/d_model of the parameters
+  unfreeze_attn:      false
+  unfreeze_ffn:       false
+
+  dropout:        0.0
+  drop_path_rate: 0.0
+
+  # ---- Sliding-window evaluation over full-width range images ----
+  window_size:   [64, 384]
+  window_stride: [64, 384]
 
 # ─────────────────────────────────────────────────────────────
 training:
-  batch_size:   4
-  lr:           2.0e-4
-  weight_decay: 1.0e-4
-  max_steps:    300000
-  save_every:   5000
-  log_every:    100
-  num_workers:  4
-  log_dir:      ./checkpoints
+  id:             rangedit_semantickitti  # name identifying the run
+  n_epochs:       50
+  batch_size:     4
+  batch_size_val: 1                       # has to be 1 (sliding-window inference)
+  lr:             2.0e-4
+  weight_decay:   0.01
+  warmup_epochs:  2
+  use_fp16:       true
+  val_frequency:  5                       # run validation every N epochs
+  train_result_frequency: 10              # print the per-class train table every N epochs
+  log_frequency:  100                     # print a log line every N iterations
+  num_workers:    4
+  save_path:      ./log
+  seed:           1
+  checkpoint:     null                    # path of a RangeDiT checkpoint to resume from
