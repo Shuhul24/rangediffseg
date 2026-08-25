@@ -1,6 +1,11 @@
 torch>=1.12.0
-torchvision>=0.13.0
 numpy>=1.21
 scipy>=1.7
 pyyaml>=6.0
-tqdm>=4.62
+
+# Optional: enables the tensorboard logs written next to the console log
+# tensorboard>=2.9
+
+# Optional: only needed to build the nuScenes keyframe index from the metadata
+# tables. Not required if dataset.info_path points at a pre-generated index.
+# nuscenes-devkit>=1.1.9

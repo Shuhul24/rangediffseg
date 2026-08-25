@@ -1,123 +1,195 @@
 """
-Inference script: run DDPM reverse diffusion on range-view images,
-then back-project 2-D predictions to per-point 3-D labels.
-Adapted from RangeViT (back-projection) and SegDiff (sampling).
+Evaluation script: runs the fine-tuned DiT over full-width range images with a
+sliding window, back-projects the 2-D predictions to per-point 3-D labels and
+reports both the pixel-wise (2-D) and the point-wise (3-D) mIoU.
+
+The sliding-window evaluation and the back-projection follow RangeViT
+(github.com/valeoai/rangevit).
 
 Usage:
-    python inference.py --config config.yaml --checkpoint ckpt.pt
+    python inference.py config.yaml --data_root /path/to/SemanticKITTI \
+                        --checkpoint log/log_<id>/checkpoint/best_mean_iou_model.pth
 """
 
 import argparse
-import yaml
+import os
+import time
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
-from dataset import RangeViewDataset
-from diffusion import GaussianDiffusion, UNet
+import dataset
+import utils
+from option import Option
+from train import build_rangedit_model
+from utils.inference import sliding_window_inference
+from utils.tools import Recorder, eval_results
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--config',     default='config.yaml')
-    p.add_argument('--checkpoint', required=True)
-    p.add_argument('--split',      default='val',
-                   help='which dataset split to evaluate (val / test)')
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description='RangeDiT evaluation options')
+    parser.add_argument('config_path', type=str, nargs='?', default='config.yaml',
+                        help='path of the config file, type: string')
+    parser.add_argument('--config', dest='config_path',
+                        help='path of the config file (alias of the positional argument)')
+    parser.add_argument('--data_root', type=str, default=None,
+                        help='path to the dataset root, type: string')
+    parser.add_argument('--save_path', type=str, default=None,
+                        help='path where the evaluation log is written, type: string')
+    parser.add_argument('--id', type=str, default=None, help='name to identify the run')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='path of the RangeDiT checkpoint to evaluate, type: string')
+    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'],
+                        help='dataset split to evaluate')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='number of threads used for data loading, type: int')
+    parser.add_argument('--window_stride', type=int, default=None,
+                        help='sliding window stride along the width, type: int')
+    parser.add_argument('--save_eval_results', action='store_true',
+                        help='write the per-point predictions in the benchmark format')
+    parser.add_argument('--seed', type=int, default=None, help='random seed')
+    args = parser.parse_args()
+    args.test_split = (args.split == 'test')
+    args.val_only = True
+    args.pretrained_model = None
+    args.batch_size = None
+    args.log_frequency = None
+    return args
 
 
-def iou_per_class(pred, gt, num_classes):
-    """Compute per-class IoU; returns (num_classes,) array."""
-    iou = np.zeros(num_classes, dtype=np.float64)
-    for c in range(num_classes):
-        tp = ((pred == c) & (gt == c)).sum()
-        fp = ((pred == c) & (gt != c)).sum()
-        fn = ((pred != c) & (gt == c)).sum()
-        iou[c] = tp / max(tp + fp + fn, 1)
-    return iou
+def save_predictions(pred_3d, entry, prediction_path, inv_lut, dataset_name):
+    """
+    Write per-point predictions in the format each benchmark expects.
+
+    SemanticKITTI: uint32 `.label` files in the raw label space, under
+        sequences/<seq>/predictions/<frame>.label
+    nuScenes: uint8 `<sample_data_token>_lidarseg.bin` files. These carry the
+        17-class training labels (0 = ignore, 1-16 = the challenge classes);
+        check the current lidarseg submission spec before uploading them.
+    """
+    if dataset_name == 'nuScenes':
+        out_dir = os.path.join(prediction_path, 'lidarseg')
+        os.makedirs(out_dir, exist_ok=True)
+        pred_3d.astype(np.uint8).tofile(
+            os.path.join(out_dir, entry['stem'] + '_lidarseg.bin'))
+        return
+
+    out_dir = os.path.join(prediction_path, 'sequences', entry['seq'], 'predictions')
+    os.makedirs(out_dir, exist_ok=True)
+    inv_lut[pred_3d].astype(np.uint32).tofile(os.path.join(out_dir, entry['stem'] + '.label'))
 
 
-def infer():
+def main():
     args = parse_args()
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    settings = Option(args.config_path, args)
+    settings.save_path = os.path.join(settings.save_path, 'Eval_{}'.format(args.split))
+    settings.check_path()
 
+    torch.manual_seed(settings.seed)
+    np.random.seed(settings.seed)
+
+    recorder = Recorder(settings, settings.save_path, use_tensorboard=False)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ---- Dataset ----
-    ds_cfg  = cfg['dataset']
-    seqs    = ds_cfg.get(f'{args.split}_seqs', ds_cfg['val_seqs'])
-    eval_ds = RangeViewDataset(
-        root      = ds_cfg['root'],
-        sequences = seqs,
-        proj_h    = ds_cfg['proj_h'],
-        proj_w    = ds_cfg['proj_w'],
-        is_train  = False,
-    )
-    loader  = DataLoader(eval_ds, batch_size=1, shuffle=False, num_workers=2)
+    parser = dataset.build_parser(
+        settings.dataset, settings.data_root, args.split, settings)
+    eval_ds = dataset.RangeViewDataset(
+        parser,
+        proj_h=settings.proj_h,
+        proj_w=settings.proj_w,
+        fov_up=settings.fov_up,
+        fov_down=settings.fov_down,
+        img_mean=settings.img_mean,
+        img_stds=settings.img_stds,
+        image_size=None,
+        is_train=False,
+        return_points=True)
+
+    loader = torch.utils.data.DataLoader(
+        eval_ds, batch_size=1, shuffle=False,
+        num_workers=settings.num_workers, drop_last=False)
 
     # ---- Model ----
-    m_cfg = cfg['model']
-    model = UNet(
-        img_channels   = 5,
-        num_classes    = 20,
-        base_ch        = m_cfg['base_ch'],
-        ch_mults       = tuple(m_cfg['ch_mults']),
-        num_res_blocks = m_cfg['num_res_blocks'],
-        use_mid_attn   = m_cfg.get('use_mid_attn', True),
-        dropout        = 0.0,
-    ).to(device)
-
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt['model'])
+    model = build_rangedit_model(settings, pretrained_path=None).to(device)
+    checkpoint_data = torch.load(args.checkpoint, map_location='cpu')
+    model.load_state_dict(checkpoint_data.get('model', checkpoint_data), strict=True)
     model.eval()
+    recorder.logger.info(f'Loaded checkpoint {args.checkpoint} '
+                         f'(epoch {checkpoint_data.get("epoch", "n/a")})')
 
-    diffusion = GaussianDiffusion(
-        num_timesteps = cfg['diffusion']['num_timesteps'],
-        schedule      = cfg['diffusion']['schedule'],
-    )
+    # ---- Metrics ----
+    metrics_2d = utils.metrics.IOUEval(n_classes=settings.n_classes,
+                                       device=torch.device('cpu'), ignore=[0])
+    metrics_3d = utils.metrics.IOUEval(n_classes=settings.n_classes,
+                                       device=torch.device('cpu'), ignore=[0])
 
-    num_classes  = 20
-    all_iou      = []
+    prediction_path = os.path.join(settings.save_path, 'preds')
+    total_iter = len(loader)
+    t_start = time.time()
 
-    print(f'Evaluating on {len(eval_ds)} scans...')
-    for seg, img, mask, labels_2d, uproj in loader:
-        img_dev = img.to(device)
-        B, C, H, W = img_dev.shape
+    recorder.logger.info(f'Evaluating on {len(eval_ds)} scans '
+                         f'(window {settings.window_size}, stride {settings.window_stride})...')
 
-        # ---- DDPM reverse diffusion → predicted segmentation ----
-        pred_seg = diffusion.p_sample_loop(
-            model  = model,
-            shape  = (B, num_classes, H, W),
-            cond   = img_dev,
-            device = device,
-        )  # (1, 20, H, W) in [-1, 1]
+    for i, (feature, label_2d, mask, px, py, point_labels) in enumerate(loader):
+        feature = feature.to(device)
 
-        # Discrete 2-D predictions: argmax over class dimension
-        pred_2d = pred_seg[0].argmax(dim=0).cpu().numpy()  # (H, W)
+        with torch.no_grad():
+            logits = sliding_window_inference(
+                model, feature,
+                window_size=settings.window_size,
+                window_stride=settings.window_stride,
+                n_cls=settings.n_classes,
+                batch_size=1)
 
-        # ---- Back-project 2-D predictions → per-point 3-D labels ----
-        ux = uproj['x'][0].numpy()   # (N,)
-        uy = uproj['y'][0].numpy()   # (N,)
-        pred_3d = pred_2d[uy, ux]    # (N,) point-wise labels
+        pred_2d = logits.argmax(dim=0).cpu()                     # (H, W)
 
-        # Ground-truth 3-D labels reconstructed from 2-D label map
-        gt_2d   = labels_2d[0].numpy()
-        gt_3d   = gt_2d[uy, ux]
+        # Back-project the 2-D predictions to per-point 3-D labels
+        px_np, py_np = px[0].numpy(), py[0].numpy()
+        pred_3d = pred_2d.numpy()[py_np, px_np]                  # (N,)
 
-        # Ignore class 0 (unlabelled) in IoU
-        valid   = gt_3d > 0
-        iou     = iou_per_class(pred_3d[valid], gt_3d[valid], num_classes)
-        all_iou.append(iou)
+        if not args.test_split:
+            gt_3d = point_labels[0].numpy()
+            metrics_2d.addBatch(pred_2d, label_2d[0])
+            metrics_3d.addBatch(torch.from_numpy(pred_3d), torch.from_numpy(gt_3d))
 
-    all_iou = np.stack(all_iou)              # (N_scans, 20)
-    miou    = all_iou[:, 1:].mean()          # exclude class-0 (ignore)
-    per_cls = all_iou[:, 1:].mean(axis=0)   # per-class mean over scans
+        if args.save_eval_results:
+            save_predictions(pred_3d, eval_ds.parser.files[i], prediction_path,
+                             eval_ds.parser.inv_lut, settings.dataset)
 
-    print(f'\nmIoU (classes 1-19): {miou * 100:.2f}%')
-    for c, v in enumerate(per_cls, start=1):
-        print(f'  class {c:2d}: {v * 100:.2f}%')
+        if (i % settings.log_frequency == 0) or (i == total_iter - 1):
+            elapsed = time.time() - t_start
+            log_str = '>>> {} I[{:04d}|{:04d}] PT[{:.3f}] '.format(
+                'Evaluation', total_iter, i + 1, elapsed / (i + 1))
+            if not args.test_split:
+                mean_iou_3d, _ = metrics_3d.getIoU()
+                log_str += 'IOU {:0.4F} '.format(mean_iou_3d.item())
+            log_str += 'ET {}'.format(str(int(elapsed)) + 's')
+            recorder.logger.info(log_str)
+
+    if args.test_split:
+        recorder.logger.info(f'Predictions written to {prediction_path}')
+        return
+
+    for name, metrics in (('Pixel', metrics_2d), ('Point', metrics_3d)):
+        mean_acc, class_acc = metrics.getAcc()
+        mean_recall, class_recall = metrics.getRecall()
+        mean_iou, class_iou = metrics.getIoU()
+        eval_results(pixel_or_point=name,
+                     settings=settings,
+                     recorder=recorder,
+                     metrics_dict={
+                         'mean_acc': mean_acc, 'class_acc': class_acc,
+                         'mean_recall': mean_recall, 'class_recall': class_recall,
+                         'mean_iou': mean_iou, 'class_iou': class_iou,
+                         'conf_matrix': metrics.conf_matrix.clone().cpu(),
+                     },
+                     class_names=eval_ds.mapped_cls_name,
+                     print_data_distribution=True)
+
+    if args.save_eval_results:
+        recorder.logger.info(f'Predictions written to {prediction_path}')
 
 
 if __name__ == '__main__':
-    infer()
+    main()
