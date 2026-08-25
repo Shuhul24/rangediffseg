@@ -34,10 +34,24 @@ class Option(object):
         self.proj_w = ds_cfg.get('proj_w', 2048)
         self.fov_up = ds_cfg.get('fov_up', 3.0)
         self.fov_down = ds_cfg.get('fov_down', -25.0)
+        self.img_mean = ds_cfg.get('img_mean', None)
+        self.img_stds = ds_cfg.get('img_stds', None)
+        self.augmentation = ds_cfg.get('augmentation', {})
+
+        # SemanticKITTI: sequence folders
         self.train_seqs = ds_cfg.get('train_seqs', [])
         self.val_seqs = ds_cfg.get('val_seqs', [])
         self.test_seqs = ds_cfg.get('test_seqs', [])
-        self.augmentation = ds_cfg.get('augmentation', {})
+
+        # nuScenes: metadata version and where the keyframe index comes from
+        self.version = ds_cfg.get('version', 'v1.0-trainval')
+        self.info_path = ds_cfg.get('info_path', None)
+        self.index_cache_dir = ds_cfg.get('index_cache_dir', './cache')
+
+        # Focal-loss class weighting: RangeViT weights SemanticKITTI by point
+        # frequency and leaves nuScenes uniform.
+        self.use_cls_freq_weights = ds_cfg.get(
+            'use_cls_freq_weights', self.dataset == 'SemanticKitti')
 
         # ----------------------------- Model ----------------------------- #
         self.backbone = m_cfg.get('backbone', 'DiT-XL/2')
@@ -146,6 +160,13 @@ class Option(object):
         if self.pretrained_model is None:
             self.reuse_patch_emb = False
             self.reuse_pos_emb = False
+
+        assert self.dataset in ('SemanticKitti', 'nuScenes'), \
+            f'invalid dataset: {self.dataset}'
+
+        if self.dataset == 'SemanticKitti':
+            assert self.train_seqs and self.val_seqs, \
+                'Set dataset.train_seqs / dataset.val_seqs for SemanticKITTI'
 
         assert self.data_root is not None, \
             'Set dataset.root in the config file or pass --data_root'

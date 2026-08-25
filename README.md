@@ -2,6 +2,8 @@
 
 **LiDAR semantic segmentation on range-view images with an off-the-shelf Diffusion Transformer (DiT)**
 
+Supports **SemanticKITTI** (`config.yaml`) and **nuScenes-lidarseg** (`config_nusc.yaml`).
+
 This repository applies the [RangeViT](https://github.com/valeoai/rangevit) recipe to the
 [Diffusion Transformer](https://github.com/facebookresearch/DiT) instead of a plain ViT.
 
@@ -67,6 +69,7 @@ rangediffseg/
 │   ├── projection.py        # Spherical 3D → 2D projection & back-projection indices
 │   ├── augmentor.py         # Random 3D augmentations (flip, translate, rotate, scale)
 │   ├── semantic_kitti.py    # SemanticKITTI parser, label remapping, class statistics
+│   ├── nuscenes.py          # nuScenes-lidarseg parser, 32 → 17 class merging
 │   └── range_view_loader.py # PyTorch Dataset: projection, random crops, (feature, label, mask)
 ├── models/
 │   ├── dit.py               # DiT backbone, state-dict compatible with facebookresearch/DiT
@@ -84,7 +87,8 @@ rangediffseg/
 ├── option.py                # config.yaml → settings object, CLI overrides
 ├── train.py                 # Training entry point
 ├── inference.py             # Evaluation entry point (2-D pixel and 3-D point mIoU)
-├── config.yaml              # All hyperparameters — primary file to edit
+├── config.yaml              # SemanticKITTI hyperparameters — primary file to edit
+├── config_nusc.yaml         # nuScenes hyperparameters
 └── requirements.txt
 ```
 
@@ -137,6 +141,32 @@ Raw SemanticKITTI labels are remapped to 20 training classes (19 semantic + 1 ig
 inside `dataset/semantic_kitti.py`. Class 0 is excluded from every metric, which matches the
 official benchmark. No manual pre-processing is required.
 
+### 2.4 nuScenes-lidarseg
+
+Download **nuScenes** (full dataset) and the **nuScenes-lidarseg** annotations, and unzip them
+into one root:
+
+```
+/your/nuscenes/root/
+├── samples/LIDAR_TOP/*.pcd.bin          # keyframe scans (N × 5 float32)
+├── lidarseg/v1.0-trainval/*_lidarseg.bin # per-point labels (N × uint8)
+└── v1.0-trainval/*.json                  # metadata tables
+```
+
+The 32 general nuScenes classes are merged into the 16 + 1 lidarseg-challenge classes, using
+RangeViT's mapping (`dataset/nuscenes.py`).
+
+The list of keyframes per split comes from one of two places, set in `config_nusc.yaml`:
+
+* **`info_path: null`** (default) — built with the **nuScenes devkit**
+  (`pip install nuscenes-devkit`), which owns the official train/val scene split. The first run
+  reads the metadata tables (slow, a few minutes) and caches the result in `index_cache_dir`
+  (`./cache` by default); later runs load the cache.
+* **`info_path: /path/to/nuscenes_lidar_n_label_data_info.json`** — RangeViT's pre-generated
+  index ([download it from their repo](https://github.com/valeoai/rangevit/blob/main/dataset/nuScenes/nuscenes_lidar_n_label_data_info.json),
+  7 MB). No devkit needed, and it reproduces exactly the 28 130 train / 6 019 val samples
+  RangeViT uses.
+
 ---
 
 ## 3. Pre-trained DiT weights
@@ -171,9 +201,25 @@ dataset:
   root: /your/dataset/root        # ← set this to your SemanticKITTI root
 ```
 
+The two datasets differ only in the `dataset` section and the crop size — the model, the losses,
+the schedule and the metrics are shared:
+
+| | SemanticKITTI (`config.yaml`) | nuScenes (`config_nusc.yaml`) |
+|---|---|---|
+| `n_classes` | 20 (19 + ignore) | 17 (16 + ignore) |
+| `proj_h` / `proj_w` | 64 × 2048 | 32 × 2048 |
+| `fov_up` / `fov_down` | +3° / −25° | +10° / −30° |
+| `image_size` (train crop) | `[64, 384]` | `[32, 384]` |
+| `window_size` / `window_stride` | `[64, 384]` / `[64, 384]` | `[32, 384]` / `[32, 256]` |
+| Focal-loss weights | point-frequency weighted | uniform (`use_cls_freq_weights: false`) |
+| `lr` / `batch_size` / `n_epochs` | 2e-4 / 4 / 50 | 8e-4 / 8 / 150 |
+| Prediction export | `.label` uint32, raw KITTI labels | `_lidarseg.bin` uint8, 17-class labels |
+
 | Section | Key | Default | When to change |
 |---|---|---|---|
 | `dataset` | `proj_h` / `proj_w` | `64` / `2048` | Match your LiDAR (e.g. 32-beam → `proj_h: 32`) |
+| `dataset` | `img_mean` / `img_stds` | KITTI statistics | Per-channel normalisation (RangeViT reuses the KITTI values for nuScenes) |
+| `dataset` | `version` / `info_path` | `v1.0-trainval` / `null` | nuScenes only — see §2.4 |
 | `model` | `backbone` | `DiT-XL/2` | Only DiT-XL/2 has released weights; `DiT-B/2`, `DiT-S/2`… for from-scratch runs |
 | `model` | `pretrained_model` | `DiT-XL-2-256x256.pt` | `DiT-XL-2-512x512.pt`, a local path, or `null` for scratch |
 | `model` | `image_size` | `[64, 384]` | Size of the random crop the network is trained on |
@@ -220,7 +266,11 @@ to disable that augmentation.
 ## 5. Training
 
 ```bash
-python train.py config.yaml --data_root /your/dataset/root --save_path ./log
+# SemanticKITTI
+python train.py config.yaml      --data_root /your/semantickitti/root --save_path ./log
+
+# nuScenes
+python train.py config_nusc.yaml --data_root /your/nuscenes/root      --save_path ./log
 ```
 
 Every command-line flag is optional and overrides the config file
@@ -240,15 +290,17 @@ python train.py config.yaml --val_only --checkpoint <path/to/checkpoint.pth>
 
 ### What happens during training
 
-1. Each scan is loaded, randomly augmented in 3-D, then projected to a 64 × 2048 range image with
-   5 channels `[range, x, y, z, intensity]` and randomly cropped to 64 × 384.
-2. The conv stem turns the crop into 32 × 48 tokens of dimension 1152, and the resized DiT sin-cos
-   positional embedding is added.
+1. Each scan is loaded, randomly augmented in 3-D, then projected to a 64 × 2048 (nuScenes:
+   32 × 2048) range image with 5 channels `[range, x, y, z, intensity]` and randomly cropped to
+   64 × 384 (nuScenes: 32 × 384).
+2. The conv stem turns the crop into 32 × 48 (nuScenes: 16 × 48) tokens of dimension 1152, and the
+   resized DiT sin-cos positional embedding is added.
 3. The 28 frozen DiT blocks process the tokens, modulated by the conditioning vector.
 4. The up-conv decoder upsamples the token grid back to 64 × 384 class logits, using the
    full-resolution stem features as a skip connection.
-5. The loss is `focal + Lovász-softmax`, with the focal weights derived from the SemanticKITTI
-   class frequencies. Class 0 is ignored, and the focal term is masked to valid LiDAR pixels.
+5. The loss is `focal + Lovász-softmax`. On SemanticKITTI the focal weights come from the class
+   point frequencies; on nuScenes they are uniform, as in RangeViT. Class 0 is ignored, and the
+   focal term is masked to valid LiDAR pixels.
 6. AdamW with a warmup + cosine schedule stepped once per iteration.
 7. Checkpoints are written to `<save_path>/log_<id>/checkpoint/`: `checkpoint.pth` every epoch plus
    `best_mean_iou_model.pth` / `best_mean_acc_model.pth`.
@@ -310,8 +362,11 @@ python inference.py config.yaml \
    giving a per-point label — no KNN needed.
 4. Both the **2-D pixel-wise** and the **3-D point-wise** mIoU are reported, per class, class 0
    excluded. The point-wise number is the one comparable to the SemanticKITTI leaderboard.
-5. With `--save_eval_results`, predictions are written as `.label` files in the original
-   SemanticKITTI label space, under `<save_path>/Eval_<split>/preds/sequences/<seq>/predictions/`.
+5. With `--save_eval_results`, predictions are written in each benchmark's format under
+   `<save_path>/Eval_<split>/preds/`: SemanticKITTI as `.label` uint32 files in the original label
+   space (`sequences/<seq>/predictions/`), nuScenes as `<sample_data_token>_lidarseg.bin` uint8
+   files carrying the 17-class training labels (`lidarseg/`) — check the current lidarseg
+   submission spec before uploading those.
 
 ---
 
@@ -328,7 +383,8 @@ python inference.py config.yaml \
 | **Focal + Lovász loss** | Same combination and class weighting as RangeViT. |
 | **Sliding-window evaluation** | Trained on 64 × 384 crops, evaluated on full-width images. |
 
-**Not implemented:** the optional KPConv 3-D refiner of RangeViT. Back-projection uses the cached
+**Not implemented:** the optional KPConv 3-D refiner of RangeViT, and its scan-based (ring-order)
+projection variant — this repository always uses the spherical projection. Back-projection uses the cached
 projection indices, which corresponds to RangeViT's `use_kpconv: false` setting.
 
 ### Legacy

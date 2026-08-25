@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument('--config', dest='config_path',
                         help='path of the config file (alias of the positional argument)')
     parser.add_argument('--data_root', type=str, default=None,
-                        help='path to the SemanticKITTI root, type: string')
+                        help='path to the dataset root, type: string')
     parser.add_argument('--save_path', type=str, default=None,
                         help='path where the evaluation log is written, type: string')
     parser.add_argument('--id', type=str, default=None, help='name to identify the run')
@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument('--window_stride', type=int, default=None,
                         help='sliding window stride along the width, type: int')
     parser.add_argument('--save_eval_results', action='store_true',
-                        help='write the per-point predictions as SemanticKITTI .label files')
+                        help='write the per-point predictions in the benchmark format')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
     args = parser.parse_args()
     args.test_split = (args.split == 'test')
@@ -57,8 +57,23 @@ def parse_args():
     return args
 
 
-def save_predictions(pred_3d, entry, prediction_path, inv_lut):
-    """Write predictions as SemanticKITTI .label files (raw label space)."""
+def save_predictions(pred_3d, entry, prediction_path, inv_lut, dataset_name):
+    """
+    Write per-point predictions in the format each benchmark expects.
+
+    SemanticKITTI: uint32 `.label` files in the raw label space, under
+        sequences/<seq>/predictions/<frame>.label
+    nuScenes: uint8 `<sample_data_token>_lidarseg.bin` files. These carry the
+        17-class training labels (0 = ignore, 1-16 = the challenge classes);
+        check the current lidarseg submission spec before uploading them.
+    """
+    if dataset_name == 'nuScenes':
+        out_dir = os.path.join(prediction_path, 'lidarseg')
+        os.makedirs(out_dir, exist_ok=True)
+        pred_3d.astype(np.uint8).tofile(
+            os.path.join(out_dir, entry['stem'] + '_lidarseg.bin'))
+        return
+
     out_dir = os.path.join(prediction_path, 'sequences', entry['seq'], 'predictions')
     os.makedirs(out_dir, exist_ok=True)
     inv_lut[pred_3d].astype(np.uint32).tofile(os.path.join(out_dir, entry['stem'] + '.label'))
@@ -77,18 +92,19 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ---- Dataset ----
-    seqs = settings.test_seqs if args.test_split else settings.val_seqs
+    parser = dataset.build_parser(
+        settings.dataset, settings.data_root, args.split, settings)
     eval_ds = dataset.RangeViewDataset(
-        root=settings.data_root,
-        sequences=seqs,
+        parser,
         proj_h=settings.proj_h,
         proj_w=settings.proj_w,
         fov_up=settings.fov_up,
         fov_down=settings.fov_down,
+        img_mean=settings.img_mean,
+        img_stds=settings.img_stds,
         image_size=None,
         is_train=False,
-        return_points=True,
-        has_label=(args.test_split is False))
+        return_points=True)
 
     loader = torch.utils.data.DataLoader(
         eval_ds, batch_size=1, shuffle=False,
@@ -139,7 +155,7 @@ def main():
 
         if args.save_eval_results:
             save_predictions(pred_3d, eval_ds.parser.files[i], prediction_path,
-                             eval_ds.parser.inv_lut)
+                             eval_ds.parser.inv_lut, settings.dataset)
 
         if (i % settings.log_frequency == 0) or (i == total_iter - 1):
             elapsed = time.time() - t_start

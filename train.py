@@ -99,35 +99,39 @@ class Trainer(object):
                                  weight_decay=self.settings.weight_decay)
 
     def _initDataloader(self):
-        if self.settings.dataset != 'SemanticKitti':
-            raise ValueError('invalid dataset: {}'.format(self.settings.dataset))
+        settings = self.settings
+        print('----Using {} dataset----'.format(settings.dataset))
 
-        print('----Using SemanticKITTI dataset----')
+        eval_split = 'test' if settings.test_split else 'val'
+        train_parser = dataset.build_parser(
+            settings.dataset, settings.data_root, 'train', settings)
+        eval_parser = dataset.build_parser(
+            settings.dataset, settings.data_root, eval_split, settings)
+
+        common = dict(proj_h=settings.proj_h, proj_w=settings.proj_w,
+                      fov_up=settings.fov_up, fov_down=settings.fov_down,
+                      img_mean=settings.img_mean, img_stds=settings.img_stds)
+
         self.train_range_loader = dataset.RangeViewDataset(
-            root=self.settings.data_root,
-            sequences=self.settings.train_seqs,
-            proj_h=self.settings.proj_h,
-            proj_w=self.settings.proj_w,
-            fov_up=self.settings.fov_up,
-            fov_down=self.settings.fov_down,
-            image_size=self.settings.image_size,
+            train_parser,
+            image_size=settings.image_size,
             is_train=True,
-            aug_cfg=self.settings.augmentation)
+            aug_cfg=settings.augmentation,
+            **common)
 
-        eval_seqs = self.settings.test_seqs if self.settings.test_split else self.settings.val_seqs
         self.val_range_loader = dataset.RangeViewDataset(
-            root=self.settings.data_root,
-            sequences=eval_seqs,
-            proj_h=self.settings.proj_h,
-            proj_w=self.settings.proj_w,
-            fov_up=self.settings.fov_up,
-            fov_down=self.settings.fov_down,
+            eval_parser,
             image_size=None,          # full-width images + sliding-window inference
             is_train=False,
-            has_label=(self.settings.test_split is False))
+            **common)
 
-        # Class weights for the focal loss, from the SemanticKITTI point statistics
-        self.cls_weight = 1 / (self.train_range_loader.cls_freq + 1e-3)
+        # Class weights for the focal loss. RangeViT weights SemanticKITTI by
+        # point frequency and leaves nuScenes uniform.
+        cls_freq = self.train_range_loader.cls_freq
+        if settings.use_cls_freq_weights and cls_freq is not None:
+            self.cls_weight = 1 / (cls_freq + 1e-3)
+        else:
+            self.cls_weight = np.ones(settings.n_classes)
         self.ignore_class = [0]
         self.cls_weight[self.ignore_class] = 0
         for cl, w in enumerate(self.cls_weight):

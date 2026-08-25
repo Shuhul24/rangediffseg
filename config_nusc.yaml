@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────
+# RangeDiT configuration — nuScenes-lidarseg
+# Mirrors RangeViT's config_nusc.yaml (32-beam sensor, 17 classes).
+# ─────────────────────────────────────────────────────────────
+
+dataset:
+  name:        nuScenes
+  root:        /path/to/nuscenes     # dataset root directory  <-- SET THIS
+  version:     v1.0-trainval         # 'v1.0-trainval' or 'v1.0-mini'
+  n_classes:   17                    # 16 semantic classes + 1 ignore (index 0)
+  in_channels: 5                     # [range, x, y, z, intensity]
+  proj_h:      32                    # 32-beam sensor
+  proj_w:      2048
+  fov_up:      10.0
+  fov_down:    -30.0
+
+  # Where the keyframe list comes from. Leave `info_path` null to build it with
+  # the nuScenes devkit (`pip install nuscenes-devkit`), which owns the official
+  # train/val scene split; the result is cached in `index_cache_dir`.
+  # Alternatively point `info_path` at RangeViT's
+  # `nuscenes_lidar_n_label_data_info.json` to reuse exactly their sample lists.
+  info_path:       null
+  index_cache_dir: ./cache
+
+  # RangeViT reuses the SemanticKITTI channel statistics for nuScenes.
+  # Note that nuScenes intensity is 0-255 while KITTI's is 0-1, so the intensity
+  # channel lands on a much larger scale than the others; the stem's BatchNorms
+  # absorb it. Change img_stds[4] to ~40 if you would rather they match.
+  img_mean: [12.12, 10.88, 0.23, -1.04, 0.21]
+  img_stds: [12.32, 11.47, 6.91, 0.86, 0.16]
+
+  # RangeViT does not frequency-weight the nuScenes focal loss
+  use_cls_freq_weights: false
+
+  # 3-D augmentation (RangeViT's nuScenes settings: no x-flip, no scaling)
+  augmentation:
+    p_flipx:         0.0
+    p_flipy:         0.5
+    p_transx:        0.5
+    transx_range:    [-5.0, 5.0]
+    p_transy:        0.5
+    transy_range:    [-3.0, 3.0]
+    p_transz:        0.5
+    transz_range:    [-1.0, 0.0]
+    p_rot_yaw:       0.5
+    rot_yaw_range:   [-5.0, 5.0]
+    p_rot_pitch:     0.5
+    rot_pitch_range: [-5.0, 5.0]
+    p_rot_roll:      0.5
+    rot_roll_range:  [-5.0, 5.0]
+    p_scale:         0.0
+    scale_range:     [0.95, 1.05]
+
+# ─────────────────────────────────────────────────────────────
+model:
+  # ---- Pre-trained DiT trunk ----
+  backbone:         DiT-XL/2
+  pretrained_model: DiT-XL-2-256x256.pt
+
+  # ---- Stem: patchification, patch encoding, positional embedding ----
+  image_size:         [32, 384]       # random crop the network is trained on
+  patch_size:         [2, 8]
+  patch_stride:       [2, 8]
+  conv_stem:          ConvStem
+  stem_base_channels: 32
+  D_h:                256
+  reuse_pos_emb:      true            # DiT's 16x16 sin-cos grid → 16x48
+  reuse_patch_emb:    false
+  learnable_pos_emb:  true
+
+  # ---- Decoder ----
+  decoder:      up_conv
+  skip_filters: 256                   # 0 = off, else = D_h
+
+  # ---- adaLN-Zero conditioning of the DiT blocks ----
+  cond_timestep:  0
+  cond_class:     null
+  learnable_cond: true
+  cond_mode:      static
+
+  # ---- Which parts of the trunk are trained ----
+  freeze_dit_encoder: true
+  unfreeze_adaln:     true
+  adaln_bias_only:    true
+  unfreeze_attn:      false
+  unfreeze_ffn:       false
+
+  dropout:        0.0
+  drop_path_rate: 0.0
+
+  # ---- Sliding-window evaluation over full-width range images ----
+  window_size:   [32, 384]
+  window_stride: [32, 256]
+
+# ─────────────────────────────────────────────────────────────
+training:
+  id:             rangedit_nuscenes
+  n_epochs:       150
+  batch_size:     8
+  batch_size_val: 1
+  lr:             8.0e-4
+  weight_decay:   0.01
+  warmup_epochs:  10
+  use_fp16:       true
+  val_frequency:  10
+  train_result_frequency: 100
+  log_frequency:  100
+  num_workers:    4
+  save_path:      ./log
+  seed:           1
+  checkpoint:     null
