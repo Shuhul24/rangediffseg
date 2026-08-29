@@ -277,6 +277,13 @@ class Trainer(object):
                         lr, loss.item(), mean_acc.item(), mean_iou.item())
                     log_str += 'RT {}'.format(remain_time)
                     self.recorder.logger.info(log_str)
+                    self.recorder.log_wandb({
+                        f'{mode}/iter_loss': loss.item(),
+                        f'{mode}/iter_mean_acc': mean_acc.item(),
+                        f'{mode}/iter_mean_iou': mean_iou.item(),
+                        'train/lr': lr,
+                        'epoch': epoch + 1,
+                    }, step=epoch * total_iter + i + 1)
 
         with torch.no_grad():
             mean_acc, class_acc = self.metrics.getAcc()
@@ -319,6 +326,16 @@ class Trainer(object):
                 self.recorder.tensorboard.add_scalar(f'{mode}/loss', loss_dict['loss_meter_avg'], epoch)
                 self.recorder.tensorboard.add_scalar(f'{mode}/mean_iou', mean_iou.item(), epoch)
                 self.recorder.tensorboard.add_scalar(f'{mode}/mean_acc', mean_acc.item(), epoch)
+
+            self.recorder.log_wandb({
+                f'{mode}/loss': loss_dict['loss_meter_avg'],
+                f'{mode}/loss_focal': loss_dict['loss_focal'],
+                f'{mode}/loss_lovasz': loss_dict['loss_lovasz'],
+                f'{mode}/mean_iou': mean_iou.item(),
+                f'{mode}/mean_acc': mean_acc.item(),
+                f'{mode}/mean_recall': mean_recall.item(),
+                'epoch': epoch + 1,
+            }, step=(epoch + 1) * total_iter)
 
         return {'mean_iou': mean_iou.item(), 'mean_acc': mean_acc.item()}
 
@@ -401,6 +418,7 @@ class Experiment(object):
             self.trainer.run(self.epoch_start, mode='Validation', print_results=True)
             self.recorder.logger.info('==== Total cost time: {}'.format(
                 datetime.timedelta(seconds=time.time() - t_start)))
+            self.recorder.finish_wandb()
             return
 
         best_val_result = None
@@ -436,6 +454,7 @@ class Experiment(object):
 
         self.recorder.logger.info('=== Total cost time: {}'.format(
             datetime.timedelta(seconds=time.time() - t_start)))
+        self.recorder.finish_wandb()
 
 
 def parse_args():
@@ -459,6 +478,11 @@ def parse_args():
                         help='path of a RangeDiT checkpoint to resume from, type: string')
     parser.add_argument('--window_stride', type=int, default=None,
                         help='sliding window stride along the width during validation, type: int')
+    parser.add_argument('--use_wandb', action='store_true', help='enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default=None, help='Weights & Biases project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/team')
+    parser.add_argument('--wandb_name', type=str, default=None, help='Weights & Biases run name')
+    parser.add_argument('--wandb_mode', type=str, default=None, help='Weights & Biases mode, e.g. online/offline')
     parser.add_argument('--val_only', action='store_true', help='run inference only')
     parser.add_argument('--test_split', action='store_true', help='run inference on the test split')
     parser.add_argument('--log_frequency', type=int, default=None, help='logging frequency')
