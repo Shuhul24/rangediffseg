@@ -25,6 +25,13 @@ class Option(object):
         self.num_workers = t_cfg.get('num_workers', 4)
         self.id = t_cfg.get('id', 'rangedit')
 
+        # ----------------------------- Weights & Biases ------------------- #
+        self.use_wandb = t_cfg.get('use_wandb', False)
+        self.wandb_project = t_cfg.get('wandb_project', 'rangediffseg')
+        self.wandb_entity = t_cfg.get('wandb_entity', None)
+        self.wandb_name = t_cfg.get('wandb_name', self.id)
+        self.wandb_mode = t_cfg.get('wandb_mode', None)
+
         # ------------------------------ Data ----------------------------- #
         self.dataset = ds_cfg.get('name', 'SemanticKitti')
         self.data_root = ds_cfg.get('root', None)
@@ -116,12 +123,13 @@ class Option(object):
     def _apply_args(self, args):
         """Command-line arguments override the YAML file when provided."""
         for name in ('data_root', 'save_path', 'id', 'num_workers', 'pretrained_model',
-                     'checkpoint', 'log_frequency', 'seed', 'batch_size'):
+                     'checkpoint', 'log_frequency', 'seed', 'batch_size',
+                     'wandb_project', 'wandb_entity', 'wandb_name', 'wandb_mode'):
             value = getattr(args, name, None)
             if value is not None:
                 setattr(self, name, value)
 
-        for name in ('val_only', 'test_split', 'save_eval_results'):
+        for name in ('val_only', 'test_split', 'save_eval_results', 'use_wandb'):
             if getattr(args, name, False):
                 setattr(self, name, True)
 

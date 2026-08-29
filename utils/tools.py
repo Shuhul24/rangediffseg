@@ -142,6 +142,7 @@ class Recorder(object):
         os.makedirs(self.checkpoint_path, exist_ok=True)
 
         self.tensorboard = None
+        self.wandb = None
         if use_tensorboard:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -151,6 +152,42 @@ class Recorder(object):
 
         self.logger = self._initLogger()
         self._saveConfig()
+        self._initWandb()
+
+
+    def _initWandb(self):
+        if not getattr(self.settings, 'use_wandb', False):
+            return
+        try:
+            import wandb
+        except ImportError:
+            self.logger.warning('>> wandb is not available, skipping Weights & Biases logging.')
+            return
+
+        kwargs = {
+            'project': getattr(self.settings, 'wandb_project', 'rangediffseg'),
+            'name': getattr(self.settings, 'wandb_name', self.settings.id),
+            'config': getattr(self.settings, 'config', None),
+            'dir': self.save_path,
+            'resume': 'allow',
+        }
+        entity = getattr(self.settings, 'wandb_entity', None)
+        mode = getattr(self.settings, 'wandb_mode', None)
+        if entity:
+            kwargs['entity'] = entity
+        if mode:
+            kwargs['mode'] = mode
+        self.wandb = wandb.init(**kwargs)
+        self.logger.info('>> Weights & Biases logging enabled: project=%s run=%s',
+                         kwargs['project'], kwargs['name'])
+
+    def log_wandb(self, values, step=None):
+        if self.wandb is not None:
+            self.wandb.log(values, step=step)
+
+    def finish_wandb(self):
+        if self.wandb is not None:
+            self.wandb.finish()
 
     def _initLogger(self):
         logger = logging.getLogger('console')
