@@ -291,7 +291,7 @@ This restores the optimizer and AMP scaler, so use it for interrupted runs.
 ```bash
 python train.py config.yaml \
     --finetune_from log/log_rangedit_semantickitti/checkpoint/best_mean_iou_model.pth \
-    --lr 5e-5 --n_epochs 80 --warmup_epochs 1 --val_frequency 2 --window_stride 256
+    --lr 5e-5 --batch_size 6 --n_epochs 80 --warmup_epochs 1 --val_frequency 2 --window_stride 256
 ```
 
 This is the recommended next step after a converged run: keep the trained model weights, restart

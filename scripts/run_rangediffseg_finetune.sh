@@ -18,6 +18,7 @@ DATA_ROOT=${DATA_ROOT:-/scratch/p24cs0005/kitti/dataset}
 SAVE_PATH=${SAVE_PATH:-/scratch/p24cs0005/exp/ckpt/rangediffseg}
 RUN_ID=${RUN_ID:-rangedit_semantickitti_finetune_lr5e5_overlap}
 LR=${LR:-5e-5}
+BATCH_SIZE=${BATCH_SIZE:-6}
 N_EPOCHS=${N_EPOCHS:-80}
 WARMUP_EPOCHS=${WARMUP_EPOCHS:-1}
 VAL_FREQUENCY=${VAL_FREQUENCY:-2}
@@ -34,6 +35,7 @@ echo "data_root=${DATA_ROOT}"
 echo "save_path=${SAVE_PATH}"
 echo "run_id=${RUN_ID}"
 echo "lr=${LR}"
+echo "batch_size=${BATCH_SIZE}"
 echo "n_epochs=${N_EPOCHS}"
 echo "warmup_epochs=${WARMUP_EPOCHS}"
 echo "val_frequency=${VAL_FREQUENCY}"
@@ -55,6 +57,7 @@ python -u train.py --config config.yaml \
   --id "${RUN_ID}" \
   --finetune_from "${FINETUNE_FROM}" \
   --lr "${LR}" \
+  --batch_size "${BATCH_SIZE}" \
   --n_epochs "${N_EPOCHS}" \
   --warmup_epochs "${WARMUP_EPOCHS}" \
   --val_frequency "${VAL_FREQUENCY}" \
