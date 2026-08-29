@@ -84,7 +84,7 @@ model:
 
   # ---- Sliding-window evaluation over full-width range images ----
   window_size:   [64, 384]
-  window_stride: [64, 384]
+  window_stride: [64, 256]             # overlap windows to reduce crop-boundary artifacts
 
 # ─────────────────────────────────────────────────────────────
 training:
@@ -103,3 +103,5 @@ training:
   save_path:      ./log
   seed:           1
   checkpoint:     null                    # path of a RangeDiT checkpoint to resume from
+  finetune_from:  null                    # load model weights only and start a fresh optimizer
+  finetune_strict: true                   # set false when changing architecture knobs

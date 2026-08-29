@@ -283,7 +283,7 @@ class Trainer(object):
                         f'{mode}/iter_mean_iou': mean_iou.item(),
                         'train/lr': lr,
                         'epoch': epoch + 1,
-                    }, step=epoch * total_iter + i + 1)
+                    })
 
         with torch.no_grad():
             mean_acc, class_acc = self.metrics.getAcc()
@@ -335,7 +335,7 @@ class Trainer(object):
                 f'{mode}/mean_acc': mean_acc.item(),
                 f'{mode}/mean_recall': mean_recall.item(),
                 'epoch': epoch + 1,
-            }, step=(epoch + 1) * total_iter)
+            })
 
         return {'mean_iou': mean_iou.item(), 'mean_acc': mean_acc.item()}
 
@@ -381,6 +381,18 @@ class Experiment(object):
         return model
 
     def _loadCheckpoint(self):
+        if self.settings.finetune_from is not None:
+            print(f'Fine-tune model weights from checkpoint {self.settings.finetune_from}')
+            if not os.path.isfile(self.settings.finetune_from):
+                raise FileNotFoundError('fine-tune checkpoint file not found: {}'.format(
+                    self.settings.finetune_from))
+
+            checkpoint_data = torch.load(self.settings.finetune_from, map_location='cpu')
+            state_dict = checkpoint_data.get('model', checkpoint_data)
+            msg = self.model.load_state_dict(state_dict, strict=self.settings.finetune_strict)
+            print(f'{msg}')
+            return
+
         if self.settings.checkpoint is None:
             return
 
@@ -476,8 +488,24 @@ def parse_args():
                              '(e.g. DiT-XL-2-256x256.pt or a local path), type: string')
     parser.add_argument('--checkpoint', '--resume', dest='checkpoint', type=str, default=None,
                         help='path of a RangeDiT checkpoint to resume from, type: string')
+    parser.add_argument('--finetune_from', type=str, default=None,
+                        help='load model weights from this checkpoint and start a fresh optimizer')
+    parser.add_argument('--finetune_non_strict', action='store_true',
+                        help='allow missing/unexpected keys when using --finetune_from')
     parser.add_argument('--window_stride', type=int, default=None,
                         help='sliding window stride along the width during validation, type: int')
+    parser.add_argument('--n_epochs', type=int, default=None, help='number of epochs, type: int')
+    parser.add_argument('--lr', type=float, default=None, help='learning rate, type: float')
+    parser.add_argument('--warmup_epochs', type=int, default=None,
+                        help='number of warmup epochs, type: int')
+    parser.add_argument('--val_frequency', type=int, default=None,
+                        help='validation frequency in epochs, type: int')
+    parser.add_argument('--cond_mode', type=str, default=None, choices=['static', 'context'],
+                        help='DiT conditioning mode')
+    parser.add_argument('--unfreeze_attn', action='store_true',
+                        help='also train the DiT attention layers')
+    parser.add_argument('--unfreeze_ffn', action='store_true',
+                        help='also train the DiT feed-forward layers')
     parser.add_argument('--use_wandb', action='store_true', help='enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default=None, help='Weights & Biases project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/team')

@@ -143,6 +143,7 @@ class Recorder(object):
 
         self.tensorboard = None
         self.wandb = None
+        self.wandb_step = 0
         if use_tensorboard:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -177,17 +178,32 @@ class Recorder(object):
             kwargs['entity'] = entity
         if mode:
             kwargs['mode'] = mode
-        self.wandb = wandb.init(**kwargs)
+        try:
+            self.wandb = wandb.init(**kwargs)
+        except Exception as exc:
+            self.logger.warning('>> wandb failed to initialize, skipping Weights & Biases logging: %s',
+                                exc)
+            self.wandb = None
+            return
         self.logger.info('>> Weights & Biases logging enabled: project=%s run=%s',
                          kwargs['project'], kwargs['name'])
 
-    def log_wandb(self, values, step=None):
+    def log_wandb(self, values):
         if self.wandb is not None:
-            self.wandb.log(values, step=step)
+            try:
+                self.wandb.log(values, step=self.wandb_step)
+                self.wandb_step += 1
+            except Exception as exc:
+                self.logger.warning('>> wandb logging failed, disabling Weights & Biases logging: %s',
+                                    exc)
+                self.wandb = None
 
     def finish_wandb(self):
         if self.wandb is not None:
-            self.wandb.finish()
+            try:
+                self.wandb.finish()
+            except Exception as exc:
+                self.logger.warning('>> wandb failed to finish cleanly: %s', exc)
 
     def _initLogger(self):
         logger = logging.getLogger('console')
