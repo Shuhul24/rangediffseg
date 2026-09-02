@@ -101,9 +101,10 @@ pip install -r requirements.txt
 ```
 
 `requirements.txt` covers `torch`, `numpy`, `scipy` and `pyyaml`. `tensorboard` is optional — if
-it is installed, scalars are written next to the console log. `timm`, `einops` and `prettytable`
-(used by the upstream repositories) are **not** required: the DiT blocks, the anisotropic pixel
-shuffle and the result tables are implemented here directly.
+it is installed, scalars are written next to the console log. `wandb` is also optional and is only
+used when Weights & Biases logging is enabled. `timm`, `einops` and `prettytable` (used by the
+upstream repositories) are **not** required: the DiT blocks, the anisotropic pixel shuffle and the
+result tables are implemented here directly.
 
 > Tested with Python 3.9+, PyTorch 1.12+.
 
@@ -210,7 +211,7 @@ the schedule and the metrics are shared:
 | `proj_h` / `proj_w` | 64 × 2048 | 32 × 2048 |
 | `fov_up` / `fov_down` | +3° / −25° | +10° / −30° |
 | `image_size` (train crop) | `[64, 384]` | `[32, 384]` |
-| `window_size` / `window_stride` | `[64, 384]` / `[64, 384]` | `[32, 384]` / `[32, 256]` |
+| `window_size` / `window_stride` | `[64, 384]` / `[64, 256]` | `[32, 384]` / `[32, 256]` |
 | Focal-loss weights | point-frequency weighted | uniform (`use_cls_freq_weights: false`) |
 | `lr` / `batch_size` / `n_epochs` | 2e-4 / 4 / 50 | 8e-4 / 8 / 150 |
 | Prediction export | `.label` uint32, raw KITTI labels | `_lidarseg.bin` uint8, 17-class labels |
@@ -233,7 +234,7 @@ the schedule and the metrics are shared:
 | `model` | `unfreeze_adaln` | `true` | Trains the adaLN-Zero modulation (the DiT analogue of unfreezing LayerNorms) |
 | `model` | `adaln_bias_only` | `true` | Trains only the modulation bias — same expressive power, 1/`d_model` of the parameters |
 | `model` | `unfreeze_attn` / `unfreeze_ffn` | `false` | Progressively unfreeze attention / MLP layers |
-| `model` | `window_size` / `window_stride` | `[64, 384]` | Sliding window used at validation and test time |
+| `model` | `window_size` / `window_stride` | `[64, 384]` / `[64, 256]` | Sliding window used at validation and test time |
 | `training` | `batch_size` | `4` | Adjust to fit your GPU VRAM |
 | `training` | `lr` | `2e-4` | AdamW; lower it (e.g. `1e-5`) when the whole trunk is unfrozen |
 | `training` | `n_epochs` | `50` | |
@@ -274,13 +275,40 @@ python train.py config_nusc.yaml --data_root /your/nuscenes/root      --save_pat
 ```
 
 Every command-line flag is optional and overrides the config file
-(`--id`, `--batch_size`, `--num_workers`, `--pretrained_model`, `--log_frequency`, `--seed`).
+(`--id`, `--batch_size`, `--num_workers`, `--pretrained_model`, `--log_frequency`, `--seed`,
+`--lr`, `--n_epochs`, `--warmup_epochs`, `--val_frequency`, `--window_stride`).
 
 **Resume from a checkpoint:**
 
 ```bash
 python train.py config.yaml --checkpoint log/log_rangedit_semantickitti/checkpoint/checkpoint.pth
 ```
+
+This restores the optimizer and AMP scaler, so use it for interrupted runs.
+
+**Fine-tune from the best weights with a fresh optimizer:**
+
+```bash
+python train.py config.yaml \
+    --finetune_from log/log_rangedit_semantickitti/checkpoint/best_mean_iou_model.pth \
+    --lr 5e-5 --batch_size 6 --n_epochs 80 --warmup_epochs 1 --val_frequency 2 --window_stride 256
+```
+
+This is the recommended next step after a converged run: keep the trained model weights, restart
+AdamW with a lower learning rate, and validate with overlapping sliding windows.
+
+**Fine-tune on 2 GPUs with synchronized BatchNorm:**
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=2 train.py --config config.yaml \
+    --finetune_from log/log_rangedit_semantickitti/checkpoint/best_mean_iou_model.pth \
+    --lr 1e-4 --batch_size 16 --sync_bn --n_epochs 80 --warmup_epochs 1 \
+    --val_frequency 2 --window_stride 256
+```
+
+In distributed training, `--batch_size` is the global batch size. With two GPUs,
+`--batch_size 16` gives each GPU 8 crops per iteration, and `--sync_bn` synchronizes the
+BatchNorm statistics across both workers.
 
 **Validation only:**
 
@@ -316,6 +344,13 @@ running accuracy and IoU, and the estimated remaining time:
 >>> Train E[050|001] I[2321|0101] DT[0.008] PT[0.271] LR 8.6e-06 Loss 2.4417 Acc 0.1839 IOU 0.0921 RT 10:58:22
 ...
 >>> Validation E[050|001] I[4071|0001] DT[0.005] PT[0.728] LR 8.6e-06 Loss 2.7087 Acc 0.2928 IOU 0.1193 RT 0:52:10
+```
+
+To mirror the scalar logs to Weights & Biases, install `wandb` and pass `--use_wandb`. On a cluster
+node without network/login access, use `--wandb_mode offline` and sync the run later:
+
+```bash
+python train.py config.yaml --use_wandb --wandb_project rangediffseg --wandb_mode offline
 ```
 
 Every `val_frequency` epochs (and every `train_result_frequency` epochs for the training split) the

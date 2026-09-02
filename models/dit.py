@@ -289,9 +289,14 @@ class DiTEncoder(nn.Module):
         learnable_cond=True,
         cond_mode='static',
         learnable_pos_emb=True,
+        fusion_layers=None,
+        adapter_layers=None,
+        adapter_channels=64,
+        adapter_heads=8,
     ):
         super().__init__()
         from .stems import ConvStem, PatchEmbedding  # local import: avoids a cycle
+        from .adapter import SpatialInjector, SpatialPriorModule
 
         self.conv_stem = conv_stem
         if self.conv_stem == 'none':
@@ -354,6 +359,37 @@ class DiTEncoder(nn.Module):
 
         self.final_layer = FinalModulation(d_model)
 
+        # ---- Multi-level feature fusion ----
+        # The last DiT block is specialised for noise prediction, so for a
+        # frozen trunk it is not necessarily where the most semantic features
+        # live. When `fusion_layers` is set we also tap intermediate blocks,
+        # normalise each tap, concatenate and project back to `d_model`.
+        self.fusion_layers = sorted(set(fusion_layers)) if fusion_layers else []
+        for idx in self.fusion_layers:
+            if not 0 <= idx < n_layers:
+                raise ValueError(f'fusion layer {idx} out of range for {n_layers} blocks')
+
+        if self.fusion_layers:
+            n_taps = len(self.fusion_layers) + 1        # + the final_layer output
+            self.fusion_norms = nn.ModuleList(
+                [nn.LayerNorm(d_model, eps=1e-6) for _ in range(len(self.fusion_layers))])
+            self.fusion_proj = nn.Linear(n_taps * d_model, d_model, bias=True)
+
+        # ---- Range-view spatial-prior adapter (ViT-Adapter style) ----
+        # The frozen blocks otherwise see LiDAR structure only once, at the
+        # stem. These injectors re-supply it at several depths.
+        self.adapter_layers = sorted(set(adapter_layers)) if adapter_layers else []
+        for idx in self.adapter_layers:
+            if not 0 <= idx < n_layers:
+                raise ValueError(f'adapter layer {idx} out of range for {n_layers} blocks')
+
+        if self.adapter_layers:
+            self.spatial_prior = SpatialPriorModule(
+                in_channels=channels, base_channels=adapter_channels, d_model=d_model)
+            self.injectors = nn.ModuleList(
+                [SpatialInjector(d_model, n_heads=adapter_heads, dropout=dropout)
+                 for _ in self.adapter_layers])
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -377,6 +413,16 @@ class DiTEncoder(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+
+        # Fusion starts as a no-op: the projection passes the final_layer
+        # output straight through and ignores the intermediate taps, so
+        # training begins exactly where the single-tap model would.
+        if self.fusion_layers:
+            nn.init.constant_(self.fusion_proj.weight, 0)
+            nn.init.constant_(self.fusion_proj.bias, 0)
+            d = self.d_model
+            with torch.no_grad():
+                self.fusion_proj.weight[:, -d:] = torch.eye(d)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -414,8 +460,23 @@ class DiTEncoder(nn.Module):
         x = self.dropout(x + pos_embed)
 
         c = self.get_conditioning(x)
-        for blk in self.blocks:
+
+        prior = self.spatial_prior(im) if self.adapter_layers else None
+        inject_at = {idx: n for n, idx in enumerate(self.adapter_layers)}
+        tap_at = set(self.fusion_layers)
+
+        taps = []
+        for i, blk in enumerate(self.blocks):
             x = blk(x, c)
+            if i in inject_at:
+                x = self.injectors[inject_at[i]](x, prior)
+            if i in tap_at:
+                taps.append(x)
 
         x = self.final_layer(x, c)
-        return x, skip
+        if not self.fusion_layers:
+            return x, skip
+
+        taps = [norm(t) for norm, t in zip(self.fusion_norms, taps)]
+        taps.append(x)
+        return self.fusion_proj(torch.cat(taps, dim=-1)), skip

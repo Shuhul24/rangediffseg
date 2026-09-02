@@ -36,6 +36,17 @@ dataset:
     p_scale:         0.5
     scale_range:     [0.95, 1.05]
 
+  # RangeAug (RangeFormer, ICCV 2023, arXiv:2303.05367): augmentations in
+  # range-image space, using a second randomly sampled scan as the donor.
+  # Probabilities are the ones reported in the paper. null = 3-D augs only.
+  range_augmentation:
+    p_range_mix:       0.9
+    range_mix_k:       [2, 3, 4, 5, 6]
+    p_range_paste:     0.9
+    p_range_union:     0.2
+    range_union_ratio: 0.5
+    p_range_shift:     1.0
+
 # ─────────────────────────────────────────────────────────────
 model:
   # ---- Pre-trained DiT trunk ----
@@ -53,6 +64,22 @@ model:
   reuse_pos_emb:      true              # resize DiT's 16x16 sin-cos grid to 32x48
   reuse_patch_emb:    false             # only possible with conv_stem: none
   learnable_pos_emb:  true              # DiT freezes it, RangeViT fine-tunes it
+
+  # ---- Multi-level feature fusion ----
+  # Block indices (0-based) tapped in addition to the final modulated layer,
+  # then concatenated and projected back to d_model. The last DiT block is
+  # tuned for noise prediction rather than semantics, so for a frozen trunk the
+  # mid blocks carry complementary signal. null = final layer only.
+  fusion_layers: [5, 11, 17, 23]
+
+  # ---- Range-view spatial-prior adapter (ViT-Adapter style) ----
+  # A convolutional pyramid over the range image, cross-attended into the
+  # frozen DiT blocks at these depths. Without it the trunk sees LiDAR-specific
+  # structure only once, at the stem. Zero-gated at init, so training starts
+  # from the un-adapted model.
+  adapter_layers:   [3, 9, 15, 21, 27]
+  adapter_channels: 64
+  adapter_heads:    8
 
   # ---- Decoder ----
   decoder:      up_conv                 # 'up_conv' or 'linear'
@@ -84,7 +111,7 @@ model:
 
   # ---- Sliding-window evaluation over full-width range images ----
   window_size:   [64, 384]
-  window_stride: [64, 384]
+  window_stride: [64, 256]             # overlap windows to reduce crop-boundary artifacts
 
 # ─────────────────────────────────────────────────────────────
 training:
@@ -103,3 +130,6 @@ training:
   save_path:      ./log
   seed:           1
   checkpoint:     null                    # path of a RangeDiT checkpoint to resume from
+  finetune_from:  null                    # load model weights only and start a fresh optimizer
+  finetune_strict: true                   # set false when changing architecture knobs
+  sync_bn:        false                   # synchronize BatchNorm when training with DDP

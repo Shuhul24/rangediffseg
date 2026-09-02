@@ -44,6 +44,7 @@ class Option(object):
         self.img_mean = ds_cfg.get('img_mean', None)
         self.img_stds = ds_cfg.get('img_stds', None)
         self.augmentation = ds_cfg.get('augmentation', {})
+        self.range_augmentation = ds_cfg.get('range_augmentation', None)
 
         # SemanticKITTI: sequence folders
         self.train_seqs = ds_cfg.get('train_seqs', [])
@@ -109,7 +110,17 @@ class Option(object):
 
         # ---------------------------- Runtime ---------------------------- #
         self.checkpoint = t_cfg.get('checkpoint', None)
-        self.finetune_pretrained_model = False
+        self.finetune_from = t_cfg.get('finetune_from', None)
+        self.finetune_strict = t_cfg.get('finetune_strict', True)
+        self.sync_bn = t_cfg.get('sync_bn', False)
+        self.fusion_layers = m_cfg.get('fusion_layers', None)
+        self.adapter_layers = m_cfg.get('adapter_layers', None)
+        self.adapter_channels = m_cfg.get('adapter_channels', 64)
+        self.adapter_heads = m_cfg.get('adapter_heads', 8)
+        self.distributed = False
+        self.rank = 0
+        self.local_rank = 0
+        self.world_size = 1
         self.val_only = False
         self.test_split = False
         self.save_eval_results = False
@@ -123,22 +134,27 @@ class Option(object):
     def _apply_args(self, args):
         """Command-line arguments override the YAML file when provided."""
         for name in ('data_root', 'save_path', 'id', 'num_workers', 'pretrained_model',
-                     'checkpoint', 'log_frequency', 'seed', 'batch_size',
+                     'checkpoint', 'finetune_from', 'log_frequency', 'seed', 'batch_size',
+                     'n_epochs', 'lr', 'warmup_epochs', 'val_frequency', 'cond_mode',
                      'wandb_project', 'wandb_entity', 'wandb_name', 'wandb_mode'):
             value = getattr(args, name, None)
             if value is not None:
                 setattr(self, name, value)
 
-        for name in ('val_only', 'test_split', 'save_eval_results', 'use_wandb'):
+        for name in ('val_only', 'test_split', 'save_eval_results', 'use_wandb',
+                     'unfreeze_attn', 'unfreeze_ffn', 'sync_bn'):
             if getattr(args, name, False):
                 setattr(self, name, True)
+
+        if getattr(args, 'finetune_non_strict', False):
+            self.finetune_strict = False
 
         window_stride = getattr(args, 'window_stride', None)
         if window_stride is not None:
             self.window_stride = [self.window_stride[0], window_stride]
 
         # A checkpoint of this model supersedes the off-the-shelf DiT weights.
-        if getattr(args, 'checkpoint', None) is not None:
+        if self.checkpoint is not None or self.finetune_from is not None:
             self.pretrained_model = None
 
     def _check_options(self):
@@ -178,6 +194,9 @@ class Option(object):
 
         assert self.data_root is not None, \
             'Set dataset.root in the config file or pass --data_root'
+
+        assert not (self.checkpoint and self.finetune_from), \
+            'Use either checkpoint/resume or finetune_from, not both'
 
     def check_path(self):
         if os.path.exists(self.save_path):

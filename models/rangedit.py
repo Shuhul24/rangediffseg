@@ -91,6 +91,10 @@ class RangeDiT(nn.Module):
         learnable_cond=True,
         cond_mode='static',
         learnable_pos_emb=True,
+        fusion_layers=None,
+        adapter_layers=None,
+        adapter_channels=64,
+        adapter_heads=8,
     ):
         super().__init__()
 
@@ -122,7 +126,11 @@ class RangeDiT(nn.Module):
             cond_class=cond_class,
             learnable_cond=learnable_cond,
             cond_mode=cond_mode,
-            learnable_pos_emb=learnable_pos_emb)
+            learnable_pos_emb=learnable_pos_emb,
+            fusion_layers=fusion_layers,
+            adapter_layers=adapter_layers,
+            adapter_channels=adapter_channels,
+            adapter_heads=adapter_heads)
 
         # ---- Segmentation decoder ----
         if decoder == 'linear':
@@ -281,6 +289,14 @@ class RangeDiT(nn.Module):
         stats['stem_num_parameters'] = count_parameters(self.rangedit.encoder.patch_embed)
         stats['encoder_num_parameters'] = (
             count_parameters(self.rangedit.encoder) - stats['stem_num_parameters'])
+        if self.rangedit.encoder.adapter_layers:
+            stats['adapter_num_parameters'] = (
+                count_parameters(self.rangedit.encoder.spatial_prior)
+                + count_parameters(self.rangedit.encoder.injectors))
+        if self.rangedit.encoder.fusion_layers:
+            stats['fusion_num_parameters'] = (
+                count_parameters(self.rangedit.encoder.fusion_proj)
+                + count_parameters(self.rangedit.encoder.fusion_norms))
         return stats
 
     def forward(self, *args):

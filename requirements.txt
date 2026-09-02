@@ -6,6 +6,9 @@ pyyaml>=6.0
 # Optional: enables the tensorboard logs written next to the console log
 # tensorboard>=2.9
 
+# Optional: enables live/offline Weights & Biases experiment tracking
+# wandb>=0.16
+
 # Optional: only needed to build the nuScenes keyframe index from the metadata
 # tables. Not required if dataset.info_path points at a pre-generated index.
 # nuscenes-devkit>=1.1.9

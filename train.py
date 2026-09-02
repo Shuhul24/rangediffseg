@@ -18,6 +18,7 @@ import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -28,6 +29,28 @@ import utils.tools as tools
 from option import Option
 from utils.inference import sliding_window_inference
 from utils.tools import Recorder, eval_results
+
+
+def init_distributed(settings):
+    if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
+        return
+
+    settings.distributed = True
+    settings.rank = int(os.environ['RANK'])
+    settings.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    settings.world_size = int(os.environ['WORLD_SIZE'])
+    if torch.cuda.is_available():
+        torch.cuda.set_device(settings.local_rank)
+    dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
+
+
+def cleanup_distributed(settings):
+    if getattr(settings, 'distributed', False) and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(settings):
+    return getattr(settings, 'rank', 0) == 0
 
 
 def build_rangedit_model(settings, pretrained_path=None):
@@ -54,7 +77,11 @@ def build_rangedit_model(settings, pretrained_path=None):
         cond_class=settings.cond_class,
         learnable_cond=settings.learnable_cond,
         cond_mode=settings.cond_mode,
-        learnable_pos_emb=settings.learnable_pos_emb)
+        learnable_pos_emb=settings.learnable_pos_emb,
+        fusion_layers=settings.fusion_layers,
+        adapter_layers=settings.adapter_layers,
+        adapter_channels=settings.adapter_channels,
+        adapter_heads=settings.adapter_heads)
     return model
 
 
@@ -62,8 +89,16 @@ class Trainer(object):
     def __init__(self, settings: Option, model: nn.Module, recorder=None):
         self.settings = settings
         self.recorder = recorder
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if self.settings.distributed and torch.cuda.is_available():
+            self.device = torch.device('cuda', self.settings.local_rank)
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
+        if self.settings.distributed:
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.settings.local_rank] if torch.cuda.is_available() else None,
+                output_device=self.settings.local_rank if torch.cuda.is_available() else None)
         self.remain_time = tools.RemainTime(self.settings.n_epochs)
 
         # Init data loaders
@@ -117,6 +152,7 @@ class Trainer(object):
             image_size=settings.image_size,
             is_train=True,
             aug_cfg=settings.augmentation,
+            range_aug_cfg=settings.range_augmentation,
             **common)
 
         self.val_range_loader = dataset.RangeViewDataset(
@@ -141,11 +177,27 @@ class Trainer(object):
             self.recorder.logger.info('weight: {}'.format(self.cls_weight))
         self.mapped_cls_name = self.train_range_loader.mapped_cls_name
 
+        train_sampler = None
+        shuffle = True
+        batch_size = self.settings.batch_size
+        if self.settings.distributed:
+            assert self.settings.batch_size % self.settings.world_size == 0, \
+                'batch_size is global and must be divisible by world_size'
+            batch_size = self.settings.batch_size // self.settings.world_size
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                self.train_range_loader,
+                num_replicas=self.settings.world_size,
+                rank=self.settings.rank,
+                shuffle=True,
+                drop_last=True)
+            shuffle = False
+
         train_loader = torch.utils.data.DataLoader(
             self.train_range_loader,
-            batch_size=self.settings.batch_size,
+            batch_size=batch_size,
             num_workers=self.settings.num_workers,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=train_sampler,
             drop_last=True,
             pin_memory=torch.cuda.is_available())
 
@@ -185,10 +237,14 @@ class Trainer(object):
     def run(self, epoch, mode='Train', print_results=False):
         if mode == 'Train':
             dataloader = self.train_loader
-            self.model.train()
+            if self.settings.distributed and hasattr(dataloader.sampler, 'set_epoch'):
+                dataloader.sampler.set_epoch(epoch)
+            model = self.model
+            model.train()
         elif mode == 'Validation':
             dataloader = self.val_loader
-            self.model.eval()
+            model = self.model.module if self.settings.distributed else self.model
+            model.eval()
         else:
             raise ValueError('invalid mode: {}'.format(mode))
 
@@ -211,7 +267,7 @@ class Trainer(object):
 
             if mode == 'Train':
                 with tools.autocast(enabled=self.fp16_scaler is not None):
-                    output = self.model(input_feature)
+                    output = model(input_feature)
                     output_softmax = F.softmax(output, dim=1)
                     total_loss, loss_lovasz, loss_focal = self.compute_losses(
                         output, output_softmax, input_label, input_mask)
@@ -234,7 +290,7 @@ class Trainer(object):
 
                     with tools.autocast(enabled=self.fp16_scaler is not None):
                         lidar_pred = sliding_window_inference(
-                            self.model,
+                            model,
                             input_feature,
                             window_size=self.settings.window_size,
                             window_stride=self.settings.window_stride,
@@ -283,7 +339,7 @@ class Trainer(object):
                         f'{mode}/iter_mean_iou': mean_iou.item(),
                         'train/lr': lr,
                         'epoch': epoch + 1,
-                    }, step=epoch * total_iter + i + 1)
+                    })
 
         with torch.no_grad():
             mean_acc, class_acc = self.metrics.getAcc()
@@ -335,7 +391,7 @@ class Trainer(object):
                 f'{mode}/mean_acc': mean_acc.item(),
                 f'{mode}/mean_recall': mean_recall.item(),
                 'epoch': epoch + 1,
-            }, step=(epoch + 1) * total_iter)
+            })
 
         return {'mean_iou': mean_iou.item(), 'mean_acc': mean_acc.item()}
 
@@ -351,7 +407,8 @@ class Experiment(object):
         np.random.seed(self.settings.seed)
         torch.backends.cudnn.benchmark = True
 
-        self.recorder = Recorder(self.settings, self.settings.save_path)
+        self.recorder = Recorder(self.settings, self.settings.save_path) \
+            if is_main_process(self.settings) else None
         self.epoch_start = 0
 
         self.model = self._initModel()
@@ -371,6 +428,9 @@ class Experiment(object):
                 unfreeze_attn=self.settings.unfreeze_attn,
                 unfreeze_ffn=self.settings.unfreeze_ffn)
 
+        if self.settings.distributed and self.settings.sync_bn:
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
         if self.recorder is not None:
             self.recorder.logger.info(f'model = {model}')
             stats = model.counter_model_parameters()
@@ -381,6 +441,19 @@ class Experiment(object):
         return model
 
     def _loadCheckpoint(self):
+        model_to_load = self.model
+        if self.settings.finetune_from is not None:
+            print(f'Fine-tune model weights from checkpoint {self.settings.finetune_from}')
+            if not os.path.isfile(self.settings.finetune_from):
+                raise FileNotFoundError('fine-tune checkpoint file not found: {}'.format(
+                    self.settings.finetune_from))
+
+            checkpoint_data = torch.load(self.settings.finetune_from, map_location='cpu')
+            state_dict = checkpoint_data.get('model', checkpoint_data)
+            msg = model_to_load.load_state_dict(state_dict, strict=self.settings.finetune_strict)
+            print(f'{msg}')
+            return
+
         if self.settings.checkpoint is None:
             return
 
@@ -389,7 +462,7 @@ class Experiment(object):
             raise FileNotFoundError('checkpoint file not found: {}'.format(self.settings.checkpoint))
 
         checkpoint_data = torch.load(self.settings.checkpoint, map_location='cpu')
-        msg = self.model.load_state_dict(checkpoint_data['model'], strict=True)
+        msg = model_to_load.load_state_dict(checkpoint_data['model'], strict=True)
         print(f'{msg}')
 
         print('==> Loading optimizer')
@@ -400,8 +473,9 @@ class Experiment(object):
                 self.trainer.fp16_scaler.load_state_dict(checkpoint_data['fp16_scaler'])
 
     def _save_checkpoint(self, epoch, path, extra=None):
+        model_to_save = self.model
         checkpoint_data = {
-            'model': self.model.state_dict(),
+            'model': model_to_save.state_dict(),
             'optimizer': self.trainer.optimizer.state_dict(),
             'epoch': epoch,
         }
@@ -415,10 +489,11 @@ class Experiment(object):
         t_start = time.time()
 
         if self.settings.val_only:
-            self.trainer.run(self.epoch_start, mode='Validation', print_results=True)
-            self.recorder.logger.info('==== Total cost time: {}'.format(
-                datetime.timedelta(seconds=time.time() - t_start)))
-            self.recorder.finish_wandb()
+            if is_main_process(self.settings):
+                self.trainer.run(self.epoch_start, mode='Validation', print_results=True)
+                self.recorder.logger.info('==== Total cost time: {}'.format(
+                    datetime.timedelta(seconds=time.time() - t_start)))
+                self.recorder.finish_wandb()
             return
 
         best_val_result = None
@@ -428,7 +503,16 @@ class Experiment(object):
             if (epoch % self.settings.val_frequency == 0 or
                     epoch == self.settings.n_epochs - 1 or
                     epoch == self.epoch_start):
-                val_result = self.trainer.run(epoch, mode='Validation')
+                if self.settings.distributed:
+                    dist.barrier()
+                val_result = None
+                if is_main_process(self.settings):
+                    val_result = self.trainer.run(epoch, mode='Validation')
+                if self.settings.distributed:
+                    dist.barrier()
+
+                if not is_main_process(self.settings):
+                    continue
 
                 self.recorder.logger.info(f'---- Best result after Epoch {epoch+1} ----')
                 if best_val_result is None:
@@ -443,18 +527,20 @@ class Experiment(object):
                             extra={k: v})
 
             # Save the last checkpoint
-            self._save_checkpoint(
-                epoch, os.path.join(self.recorder.checkpoint_path, 'checkpoint.pth'))
+            if is_main_process(self.settings):
+                self._save_checkpoint(
+                    epoch, os.path.join(self.recorder.checkpoint_path, 'checkpoint.pth'))
 
-            if best_val_result is not None:
+            if is_main_process(self.settings) and best_val_result is not None:
                 log_str = '>>> Best Result: '
                 for k, v in best_val_result.items():
                     log_str += '{}: {} '.format(k, v)
                 self.recorder.logger.info(log_str + '\n')
 
-        self.recorder.logger.info('=== Total cost time: {}'.format(
-            datetime.timedelta(seconds=time.time() - t_start)))
-        self.recorder.finish_wandb()
+        if is_main_process(self.settings):
+            self.recorder.logger.info('=== Total cost time: {}'.format(
+                datetime.timedelta(seconds=time.time() - t_start)))
+            self.recorder.finish_wandb()
 
 
 def parse_args():
@@ -476,8 +562,26 @@ def parse_args():
                              '(e.g. DiT-XL-2-256x256.pt or a local path), type: string')
     parser.add_argument('--checkpoint', '--resume', dest='checkpoint', type=str, default=None,
                         help='path of a RangeDiT checkpoint to resume from, type: string')
+    parser.add_argument('--finetune_from', type=str, default=None,
+                        help='load model weights from this checkpoint and start a fresh optimizer')
+    parser.add_argument('--finetune_non_strict', action='store_true',
+                        help='allow missing/unexpected keys when using --finetune_from')
     parser.add_argument('--window_stride', type=int, default=None,
                         help='sliding window stride along the width during validation, type: int')
+    parser.add_argument('--n_epochs', type=int, default=None, help='number of epochs, type: int')
+    parser.add_argument('--lr', type=float, default=None, help='learning rate, type: float')
+    parser.add_argument('--warmup_epochs', type=int, default=None,
+                        help='number of warmup epochs, type: int')
+    parser.add_argument('--val_frequency', type=int, default=None,
+                        help='validation frequency in epochs, type: int')
+    parser.add_argument('--cond_mode', type=str, default=None, choices=['static', 'context'],
+                        help='DiT conditioning mode')
+    parser.add_argument('--unfreeze_attn', action='store_true',
+                        help='also train the DiT attention layers')
+    parser.add_argument('--unfreeze_ffn', action='store_true',
+                        help='also train the DiT feed-forward layers')
+    parser.add_argument('--sync_bn', action='store_true',
+                        help='synchronize BatchNorm statistics across DDP workers')
     parser.add_argument('--use_wandb', action='store_true', help='enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default=None, help='Weights & Biases project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/team')
@@ -495,4 +599,8 @@ if __name__ == '__main__':
     settings = Option(args.config_path, args)
     if settings.val_only:
         settings.save_path = os.path.join(settings.save_path, 'Eval')
-    Experiment(settings).run()
+    init_distributed(settings)
+    try:
+        Experiment(settings).run()
+    finally:
+        cleanup_distributed(settings)

@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 
 from .augmentor import Augmentor
 from .projection import RangeProjection
+from .range_aug import RangeAugmentor
 
 # Per-channel mean/std used by RangeViT for both SemanticKITTI and nuScenes
 # (range, x, y, z, intensity). Override them through `dataset.img_mean` /
@@ -32,7 +33,7 @@ class RangeViewDataset(Dataset):
                  fov_up: float = 3.0, fov_down: float = -25.0,
                  image_size=None, is_train: bool = True, aug_cfg: dict = None,
                  return_points: bool = False,
-                 img_mean=None, img_stds=None):
+                 img_mean=None, img_stds=None, range_aug_cfg: dict = None):
         """
         Args:
             parser        : point-cloud parser yielding (points (N,4), labels (N,))
@@ -50,6 +51,12 @@ class RangeViewDataset(Dataset):
         self.projector = RangeProjection(proj_h, proj_w, fov_up, fov_down)
         self.num_cls = parser.NUM_CLASSES
         self.augmentor = Augmentor(aug_cfg or {}) if is_train else None
+        # RangeAug operates on the projected image and needs a donor scan.
+        self.range_augmentor = (RangeAugmentor(range_aug_cfg)
+                                if (is_train and range_aug_cfg) else None)
+        assert not (self.range_augmentor is not None and return_points), \
+            'RangeAug rewrites the range image, so the per-point indices it ' \
+            'would be paired with are no longer valid'
         self.is_train = is_train
         self.image_size = tuple(image_size) if image_size is not None else None
         self.return_points = return_points
@@ -78,6 +85,23 @@ class RangeViewDataset(Dataset):
                 labels_2d[top:top + crop_h, left:left + crop_w],
                 mask[top:top + crop_h, left:left + crop_w])
 
+    def _project_scan(self, idx):
+        """Load one scan, augment it in 3-D and project it to a range image."""
+        points, point_labels = self.parser[idx]
+
+        if self.augmentor is not None:
+            points = self.augmentor.augment(points.copy())
+
+        proj_range, proj_feat, proj_idx, proj_mask, px, py = self.projector.project(points)
+        H, W = proj_range.shape
+
+        labels_2d = np.zeros((H, W), dtype=np.int64)
+        valid = proj_idx >= 0
+        labels_2d[valid] = point_labels[proj_idx[valid]]
+
+        return (proj_feat, labels_2d, proj_mask.astype(np.float32),
+                proj_range, points, point_labels, px, py)
+
     def __getitem__(self, idx):
         """
         Returns:
@@ -87,24 +111,29 @@ class RangeViewDataset(Dataset):
         and, when `return_points` is set, additionally:
             px, py       : (N,) int64 pixel each 3-D point projects onto
             point_labels : (N,) int64 per-point ground-truth labels
+            proj_range   : (H, W) float32 range image (<= 0 where empty)
+            unproj_range : (N,) float32 true range of every point
         """
-        points, point_labels = self.parser[idx]
+        (proj_feat, labels_2d, mask, proj_range,
+         points, point_labels, px, py) = self._project_scan(idx)
 
-        if self.augmentor is not None:
-            points = self.augmentor.augment(points.copy())
-
-        proj_range, proj_feat, proj_idx, proj_mask, px, py = self.projector.project(points)
-        H, W = proj_range.shape
-
-        # Build the 2-D label map by scattering point labels via projection indices
-        labels_2d = np.zeros((H, W), dtype=np.int64)
-        valid = proj_idx >= 0
-        labels_2d[valid] = point_labels[proj_idx[valid]]
+        # RangeAug: mix / paste / union against a randomly sampled donor scan,
+        # then shift along azimuth. Applied on the raw projected features,
+        # before normalisation and cropping.
+        if self.range_augmentor is not None:
+            donor = None
+            if self.range_augmentor.needs_donor and len(self.parser) > 1:
+                j = np.random.randint(len(self.parser))
+                while j == idx:
+                    j = np.random.randint(len(self.parser))
+                d_feat, d_lab, d_mask = self._project_scan(j)[:3]
+                donor = (d_feat, d_lab, d_mask)
+            proj_feat, labels_2d, mask = self.range_augmentor(
+                (proj_feat, labels_2d, mask), donor)
 
         # Normalise the range-image features; zero out empty pixels
         feat = (proj_feat - self.mean) / self.std
-        feat[~proj_mask] = 0.0
-        mask = proj_mask.astype(np.float32)
+        feat[mask <= 0] = 0.0
 
         if self.is_train and self.image_size is not None:
             feat, labels_2d, mask = self._random_crop(feat, labels_2d, mask)
@@ -116,6 +145,12 @@ class RangeViewDataset(Dataset):
         if not self.return_points:
             return feature, label, mask
 
+        # KNN post-processing needs the range image and the true (un-projected)
+        # range of every point, both taken after augmentation.
+        unproj_range = np.linalg.norm(points[:, :3], axis=1).astype(np.float32)
+
         return (feature, label, mask,
                 torch.from_numpy(px), torch.from_numpy(py),
-                torch.from_numpy(point_labels.astype(np.int64)))
+                torch.from_numpy(point_labels.astype(np.int64)),
+                torch.from_numpy(np.ascontiguousarray(proj_range)),
+                torch.from_numpy(unproj_range))

@@ -1,3 +1,4 @@
+from . import dist
 from . import inference
 from . import losses
 from . import metrics

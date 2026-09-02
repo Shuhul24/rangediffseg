@@ -23,6 +23,7 @@ import utils
 from option import Option
 from train import build_rangedit_model
 from utils.inference import sliding_window_inference
+from utils.knn import KNNPostprocess
 from utils.tools import Recorder, eval_results
 
 
@@ -47,6 +48,20 @@ def parse_args():
                         help='sliding window stride along the width, type: int')
     parser.add_argument('--save_eval_results', action='store_true',
                         help='write the per-point predictions in the benchmark format')
+    parser.add_argument('--fusion_layers', type=str, default=None,
+                        help="override model.fusion_layers, e.g. '5,11,17,23' or 'none'. "
+                             "Checkpoints trained without fusion need 'none'.")
+    parser.add_argument('--adapter_layers', type=str, default=None,
+                        help="override model.adapter_layers, e.g. '3,9,15,21,27' or 'none'. "
+                             "Checkpoints trained without the adapter need 'none'.")
+    parser.add_argument('--no_knn', action='store_true',
+                        help='disable KNN post-processing of the back-projected labels')
+    parser.add_argument('--knn', type=int, default=3, help='number of KNN neighbours that vote')
+    parser.add_argument('--knn_search', type=int, default=7,
+                        help='side of the search window around each pixel, type: int (odd)')
+    parser.add_argument('--knn_sigma', type=float, default=2.0, help='KNN Gaussian width')
+    parser.add_argument('--knn_cutoff', type=float, default=1.0,
+                        help='reject neighbours further than this in range (metres)')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
     args = parser.parse_args()
     args.test_split = (args.split == 'test')
@@ -55,6 +70,16 @@ def parse_args():
     args.batch_size = None
     args.log_frequency = None
     return args
+
+
+def parse_fusion_layers(spec):
+    """'none'/'' -> None, '5,11,17,23' -> [5, 11, 17, 23]."""
+    if spec is None:
+        return None, False
+    spec = spec.strip().lower()
+    if spec in ('none', 'null', ''):
+        return None, True
+    return [int(v) for v in spec.replace(' ', '').split(',') if v], True
 
 
 def save_predictions(pred_3d, entry, prediction_path, inv_lut, dataset_name):
@@ -82,6 +107,15 @@ def save_predictions(pred_3d, entry, prediction_path, inv_lut, dataset_name):
 def main():
     args = parse_args()
     settings = Option(args.config_path, args)
+
+    fusion_layers, overridden = parse_fusion_layers(args.fusion_layers)
+    if overridden:
+        settings.fusion_layers = fusion_layers
+
+    adapter_layers, overridden = parse_fusion_layers(args.adapter_layers)
+    if overridden:
+        settings.adapter_layers = adapter_layers
+
     settings.save_path = os.path.join(settings.save_path, 'Eval_{}'.format(args.split))
     settings.check_path()
 
@@ -118,6 +152,19 @@ def main():
     recorder.logger.info(f'Loaded checkpoint {args.checkpoint} '
                          f'(epoch {checkpoint_data.get("epoch", "n/a")})')
 
+    # ---- KNN post-processing ----
+    post = None
+    if not args.no_knn:
+        post = KNNPostprocess(n_classes=settings.n_classes, knn=args.knn,
+                              search=args.knn_search, sigma=args.knn_sigma,
+                              cutoff=args.knn_cutoff).to(device)
+        recorder.logger.info(f'KNN post-processing enabled '
+                             f'(knn={args.knn}, search={args.knn_search}, '
+                             f'sigma={args.knn_sigma}, cutoff={args.knn_cutoff})')
+    else:
+        recorder.logger.info('KNN post-processing disabled: '
+                             'points are labelled by plain back-projection')
+
     # ---- Metrics ----
     metrics_2d = utils.metrics.IOUEval(n_classes=settings.n_classes,
                                        device=torch.device('cpu'), ignore=[0])
@@ -131,7 +178,8 @@ def main():
     recorder.logger.info(f'Evaluating on {len(eval_ds)} scans '
                          f'(window {settings.window_size}, stride {settings.window_stride})...')
 
-    for i, (feature, label_2d, mask, px, py, point_labels) in enumerate(loader):
+    for i, (feature, label_2d, mask, px, py, point_labels,
+            proj_range, unproj_range) in enumerate(loader):
         feature = feature.to(device)
 
         with torch.no_grad():
@@ -144,9 +192,18 @@ def main():
 
         pred_2d = logits.argmax(dim=0).cpu()                     # (H, W)
 
-        # Back-project the 2-D predictions to per-point 3-D labels
+        # Back-project the 2-D predictions to per-point 3-D labels. Plain
+        # indexing gives every point the label of whichever point won its
+        # pixel; the KNN vote repairs the ~20% of points that lost theirs.
         px_np, py_np = px[0].numpy(), py[0].numpy()
-        pred_3d = pred_2d.numpy()[py_np, px_np]                  # (N,)
+        if post is None:
+            pred_3d = pred_2d.numpy()[py_np, px_np]              # (N,)
+        else:
+            pred_3d = post(proj_range[0].to(device),
+                           unproj_range[0].to(device),
+                           pred_2d.to(device),
+                           px[0].to(device),
+                           py[0].to(device)).cpu().numpy()
 
         if not args.test_split:
             gt_3d = point_labels[0].numpy()
