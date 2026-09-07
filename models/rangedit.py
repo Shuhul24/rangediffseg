@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .decoders import DecoderLinear, DecoderUpConv
+from .decoders import DecoderLinear, DecoderPyramid, DecoderUpConv
 from .dit import DIT_CONFIGS, DiTEncoder, find_dit_checkpoint
 from .model_utils import adapt_input_conv, padding, resize_pos_embed, unpadding
 
@@ -58,11 +58,26 @@ class DiTSegmenter(nn.Module):
         im = padding(im, self.patch_size)
         H, W = im.size(2), im.size(3)
 
-        x, skip = self.encoder(im, return_features=True)   # (B, N, D)
+        x, skip, prior_maps = self.encoder(im, return_features=True)
 
-        feats = self.decoder(x, (H, W), skip)              # (B, n_cls, H, W)
-        feats = F.interpolate(feats, size=(H, W), mode='bilinear', align_corners=False)
-        return unpadding(feats, (H_ori, W_ori))
+        if isinstance(self.decoder, DecoderPyramid):
+            out = self.decoder(x, (H, W), skip, prior_maps=prior_maps)
+        else:
+            out = self.decoder(x, (H, W), skip)
+
+        # The pyramid decoder returns auxiliary logits while training.
+        aux = None
+        if isinstance(out, tuple):
+            out, aux = out
+
+        def _to_input_res(t):
+            t = F.interpolate(t, size=(H, W), mode='bilinear', align_corners=False)
+            return unpadding(t, (H_ori, W_ori))
+
+        feats = _to_input_res(out)
+        if aux is None:
+            return feats
+        return feats, [_to_input_res(a) for a in aux if a is not None]
 
 
 class RangeDiT(nn.Module):
@@ -95,6 +110,7 @@ class RangeDiT(nn.Module):
         adapter_layers=None,
         adapter_channels=64,
         adapter_heads=8,
+        aux_heads=True,
     ):
         super().__init__()
 
@@ -140,6 +156,16 @@ class RangeDiT(nn.Module):
                 d_encoder=encoder.d_model,
                 patch_stride=encoder.patch_stride)
             assert skip_filters == 0, 'the linear decoder has no skip connection'
+        elif decoder == 'pyramid':
+            seg_decoder = DecoderPyramid(
+                n_cls=n_cls,
+                patch_size=encoder.patch_size,
+                d_encoder=encoder.d_model,
+                d_decoder=up_conv_d_decoder,
+                patch_stride=encoder.patch_stride,
+                skip_filters=skip_filters,
+                prior_dim=encoder.d_model if adapter_layers else None,
+                aux_heads=aux_heads)
         elif decoder == 'up_conv':
             seg_decoder = DecoderUpConv(
                 n_cls=n_cls,

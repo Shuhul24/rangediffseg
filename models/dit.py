@@ -461,7 +461,9 @@ class DiTEncoder(nn.Module):
 
         c = self.get_conditioning(x)
 
-        prior = self.spatial_prior(im) if self.adapter_layers else None
+        prior, prior_maps = None, None
+        if self.adapter_layers:
+            prior, prior_maps = self.spatial_prior(im, return_maps=True)
         inject_at = {idx: n for n, idx in enumerate(self.adapter_layers)}
         tap_at = set(self.fusion_layers)
 
@@ -474,9 +476,8 @@ class DiTEncoder(nn.Module):
                 taps.append(x)
 
         x = self.final_layer(x, c)
-        if not self.fusion_layers:
-            return x, skip
-
-        taps = [norm(t) for norm, t in zip(self.fusion_norms, taps)]
-        taps.append(x)
-        return self.fusion_proj(torch.cat(taps, dim=-1)), skip
+        if self.fusion_layers:
+            taps = [norm(t) for norm, t in zip(self.fusion_norms, taps)]
+            taps.append(x)
+            x = self.fusion_proj(torch.cat(taps, dim=-1))
+        return x, skip, prior_maps

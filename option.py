@@ -117,6 +117,9 @@ class Option(object):
         self.adapter_layers = m_cfg.get('adapter_layers', None)
         self.adapter_channels = m_cfg.get('adapter_channels', 64)
         self.adapter_heads = m_cfg.get('adapter_heads', 8)
+        self.aux_heads = m_cfg.get('aux_heads', True)
+        self.aux_weight = m_cfg.get('aux_weight', 0.4)
+        self.grad_clip = t_cfg.get('grad_clip', 1.0)
         self.distributed = False
         self.rank = 0
         self.local_rank = 0

@@ -81,7 +81,8 @@ def build_rangedit_model(settings, pretrained_path=None):
         fusion_layers=settings.fusion_layers,
         adapter_layers=settings.adapter_layers,
         adapter_channels=settings.adapter_channels,
-        adapter_heads=settings.adapter_heads)
+        adapter_heads=settings.adapter_heads,
+        aux_heads=settings.aux_heads)
     return model
 
 
@@ -129,6 +130,7 @@ class Trainer(object):
 
     def _initOptimizer(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
+        self.trainable_params = params
         return torch.optim.AdamW(params=params,
                                  lr=self.settings.lr,
                                  weight_decay=self.settings.weight_decay)
@@ -268,17 +270,39 @@ class Trainer(object):
             if mode == 'Train':
                 with tools.autocast(enabled=self.fp16_scaler is not None):
                     output = model(input_feature)
+
+                    # The pyramid decoder returns auxiliary logits from its
+                    # intermediate stages while training; each contributes a
+                    # down-weighted copy of the same loss.
+                    aux_outputs = []
+                    if isinstance(output, (tuple, list)):
+                        output, aux_outputs = output
+
                     output_softmax = F.softmax(output, dim=1)
                     total_loss, loss_lovasz, loss_focal = self.compute_losses(
                         output, output_softmax, input_label, input_mask)
+
+                    for aux in aux_outputs:
+                        aux_loss, _, _ = self.compute_losses(
+                            aux, F.softmax(aux, dim=1), input_label, input_mask)
+                        total_loss = total_loss + self.settings.aux_weight * aux_loss
 
                 # Backward
                 self.optimizer.zero_grad()
                 if self.fp16_scaler is None:
                     total_loss.backward()
+                    if self.settings.grad_clip > 0:
+                        nn.utils.clip_grad_norm_(self.trainable_params,
+                                                 self.settings.grad_clip)
                     self.optimizer.step()
                 else:
                     self.fp16_scaler.scale(total_loss).backward()
+                    if self.settings.grad_clip > 0:
+                        # Gradients must be unscaled before their norm means
+                        # anything; `step` then skips if they are non-finite.
+                        self.fp16_scaler.unscale_(self.optimizer)
+                        nn.utils.clip_grad_norm_(self.trainable_params,
+                                                 self.settings.grad_clip)
                     self.fp16_scaler.step(self.optimizer)
                     self.fp16_scaler.update()
 

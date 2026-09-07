@@ -82,7 +82,13 @@ model:
   adapter_heads:    8
 
   # ---- Decoder ----
-  decoder:      up_conv                 # 'up_conv' or 'linear'
+  # 'pyramid' upsamples in three stages (2,2)->(1,2)->(1,2) instead of one 2x8
+  # jump, fuses the adapter's multi-scale pyramid (otherwise computed for the
+  # injectors and discarded), and adds auxiliary heads on the intermediate
+  # stages. 'up_conv' is the original single-stage decoder.
+  decoder:      pyramid
+  aux_heads:    true
+  aux_weight:   0.4
   skip_filters: 256                     # stem -> decoder skip connection (0 = off, else = D_h)
 
   # ---- adaLN-Zero conditioning of the DiT blocks ----
@@ -121,6 +127,9 @@ training:
   batch_size_val: 1                       # has to be 1 (sliding-window inference)
   lr:             2.0e-4
   weight_decay:   0.01
+  grad_clip:      1.0                     # max grad-norm; 0 disables. Auxiliary
+                                          # losses raise the gradient scale, so
+                                          # an unclipped run diverges at peak lr.
   warmup_epochs:  2
   use_fp16:       true
   val_frequency:  5                       # run validation every N epochs

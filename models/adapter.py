@@ -72,15 +72,24 @@ class SpatialPriorModule(nn.Module):
         self.projs = nn.ModuleList(projs)
         self.norm = nn.LayerNorm(d_model, eps=1e-6)
 
-    def forward(self, im):
-        """(B, C, H, W) -> (B, N_prior, d_model) tokens from all pyramid levels."""
+    def forward(self, im, return_maps=False):
+        """
+        (B, C, H, W) -> (B, N_prior, d_model) tokens from all pyramid levels.
+
+        With `return_maps`, also returns the per-level spatial feature maps.
+        The injectors only need the flattened tokens, but a multi-scale decoder
+        wants the maps, and they are otherwise computed and discarded.
+        """
         x = self.stem(im)
-        tokens = []
+        tokens, maps = [], []
         for level, proj in zip(self.levels, self.projs):
             x = level(x)
-            t = proj(x).flatten(2).transpose(1, 2)     # (B, h*w, d_model)
-            tokens.append(t)
-        return self.norm(torch.cat(tokens, dim=1))
+            p = proj(x)                               # (B, d_model, h, w)
+            tokens.append(p.flatten(2).transpose(1, 2))
+            if return_maps:
+                maps.append(p)
+        tok = self.norm(torch.cat(tokens, dim=1))
+        return (tok, maps) if return_maps else tok
 
 
 class SpatialInjector(nn.Module):
