@@ -91,7 +91,8 @@ rangediffseg/
 │   └── tools.py             # Meters, remaining-time estimate, logger, result tables
 ├── diffusion/               # Legacy DDPM U-Net baseline (see "Legacy" below)
 ├── tools/
-│   └── run_ablations.py     # run a set of training variants and tabulate them
+│   ├── run_ablations.py     # run a set of training variants and tabulate them
+│   └── diagnose_trunk.py    # per-block probe: is the frozen trunk doing anything?
 ├── option.py                # config.yaml → settings object, CLI overrides
 ├── train.py                 # Training entry point
 ├── inference.py             # Evaluation entry point (2-D pixel and 3-D point mIoU)
@@ -757,6 +758,37 @@ interface is unchanged). On DiT-XL/2 it is also **0.8 M cheaper**, because the w
 | `patch_stride: [2, 4]` | Halves the token footprint (32×48 → 32×96), the only change that lets the *trunk* see small objects at all. | 2× activations, 4× attention — needs `grad_checkpointing` |
 | `reuse_pos_emb: false` | DiT's positional embedding is *analytic* 2-D sin-cos, and the code already generates it correctly at 32×48 in `DiTEncoder.__init__` — then overwrites it with a bilinearly **blurred** resize of the 16×16 checkpoint grid. RangeViT had to interpolate because ViT's embedding is learnt; here you do not. | free A/B |
 | Drop `cond_mode: context` | It pools the stem features to one vector per scan, i.e. a single global modulation for a dense-prediction task. Low ceiling. | — |
+
+### Is the trunk doing anything? (`tools/diagnose_trunk.py`)
+
+Before spending a training run on the ablation, `tools/diagnose_trunk.py` answers the cheap version
+of the same question in seconds. It pushes one batch through the network and reports, per block, how
+much the block actually changes its input and how strong its adaLN-Zero gates are at the configured
+conditioning:
+
+```bash
+python -m tools.diagnose_trunk config.yaml --data_root <root>                    # as configured
+python -m tools.diagnose_trunk config.yaml --data_root <root> --checkpoint <ckpt>
+python -m tools.diagnose_trunk config.yaml --data_root <root> --sweep_timestep 0 50 100 250 500
+```
+
+```
+ blk  |dx|/|x|  gate_msa  gate_mlp  tok_std  cos(stem)  eff_rank
+   0    0.0000    0.0000    0.0000    0.565     1.0000      12.4
+```
+
+Three readings, three different fixes:
+
+| symptom | meaning | what to do |
+|---|---|---|
+| `\|dx\|/\|x\|` ≈ 0 across most blocks | the trunk is near the **identity** at this conditioning | sweep `cond_timestep`; if that changes nothing, `n_trunk_blocks: 0` should match the full model |
+| `\|dx\|/\|x\|` large, `cos(stem)` ≈ 0 | the trunk **overwrites** the stem rather than refining it, and the decoder has to undo it | tap earlier blocks (`feature_taps`) or truncate (`n_trunk_blocks`) |
+| effective rank collapsing with depth | the tokens are **degenerating** toward one vector | read from before the collapse |
+
+> Note: with `pretrained_model: null` every block is an *exact* identity at initialisation — that is
+> adaLN-Zero working as designed — and under `freeze_dit_encoder` + `adaln_bias_only` only the
+> modulation bias can move the gates off zero. A from-scratch trunk in that configuration is close to
+> a very expensive no-op; the diagnostic is only informative with the pre-trained weights loaded.
 
 ### Running the ablations
 
