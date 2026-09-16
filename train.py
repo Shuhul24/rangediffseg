@@ -26,6 +26,7 @@ import models
 import utils
 import utils.tools as tools
 from option import Option
+from utils.ema import ModelEMA
 from utils.inference import sliding_window_inference
 from utils.tools import Recorder, eval_results
 
@@ -44,8 +45,10 @@ def build_rangedit_model(settings, pretrained_path=None):
         conv_stem=settings.conv_stem,
         stem_base_channels=settings.stem_base_channels,
         stem_hidden_dim=settings.D_h,
+        stem_pool=settings.stem_pool,
         skip_filters=settings.skip_filters,
         decoder=settings.decoder,
+        decoder_stages=settings.decoder_stages,
         up_conv_d_decoder=settings.D_h,
         up_conv_scale_factor=settings.patch_stride,
         dropout=settings.dropout,
@@ -54,7 +57,10 @@ def build_rangedit_model(settings, pretrained_path=None):
         cond_class=settings.cond_class,
         learnable_cond=settings.learnable_cond,
         cond_mode=settings.cond_mode,
-        learnable_pos_emb=settings.learnable_pos_emb)
+        learnable_pos_emb=settings.learnable_pos_emb,
+        feature_taps=settings.feature_taps,
+        n_trunk_blocks=settings.n_trunk_blocks,
+        grad_checkpointing=settings.grad_checkpointing)
     return model
 
 
@@ -79,6 +85,32 @@ class Trainer(object):
             ignore=self.ignore_class)
         self.metrics.reset()
 
+        # Point-wise (3-D) validation. The 2-D pixel metric is a proxy: the
+        # spherical projection keeps one point per pixel, so the pixel mIoU is
+        # blind to the 10-20 % of points it discards -- and it is blind to them
+        # unevenly, since thin and occluded classes lose the most. The
+        # leaderboard number, and the number a paper should report, is the
+        # point-wise one, so selecting checkpoints on the pixel metric selects
+        # on the wrong quantity.
+        self.metrics_3d = None
+        self.val_knn = None
+        if self.settings.val_3d:
+            self.metrics_3d = utils.metrics.IOUEval(
+                n_classes=self.settings.n_classes, device=torch.device('cpu'),
+                ignore=self.ignore_class)
+            self.metrics_3d.reset()
+            if self.settings.val_knn:
+                from utils.knn import KNNPostProcess
+                self.val_knn = KNNPostProcess(
+                    n_classes=self.settings.n_classes,
+                    knn=self.settings.knn_k, search=self.settings.knn_search,
+                    sigma=self.settings.knn_sigma,
+                    cutoff=self.settings.knn_cutoff).to(self.device)
+            if self.recorder is not None:
+                self.recorder.logger.info(
+                    'Point-wise (3-D) validation enabled (KNN post-processing: {})'.format(
+                        'on' if self.val_knn is not None else 'off'))
+
         # Define scheduler (stepped once per iteration)
         self.scheduler = utils.scheduler.WarmupCosineLR(
             optimizer=self.optimizer,
@@ -92,8 +124,22 @@ class Trainer(object):
         if self.settings.use_fp16 and torch.cuda.is_available():
             self.fp16_scaler = tools.grad_scaler(enabled=True)
 
+        # Exponential moving average of the trainable weights. Validation and
+        # checkpointing use the averaged weights; the live weights keep training.
+        self.ema = None
+        if self.settings.ema_decay > 0:
+            self.ema = ModelEMA(
+                self.model,
+                decay=self.settings.ema_decay,
+                warmup_steps=self.settings.ema_warmup_steps).to(self.device)
+            if self.recorder is not None:
+                self.recorder.logger.info(
+                    'EMA enabled: decay={}, shadowing {} tensors'.format(
+                        self.settings.ema_decay, len(self.ema.shadow)))
+
     def _initOptimizer(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
+        self.trainable_params = params
         return torch.optim.AdamW(params=params,
                                  lr=self.settings.lr,
                                  weight_decay=self.settings.weight_decay)
@@ -112,26 +158,51 @@ class Trainer(object):
                       fov_up=settings.fov_up, fov_down=settings.fov_down,
                       img_mean=settings.img_mean, img_stds=settings.img_stds)
 
+        # ---- Tail-class handling ----------------------------------------- #
+        # A uniform 64 x 384 crop of a 64 x 2048 image contains ~1 bicycle pixel
+        # and ~0.3 motorcyclist pixels against ~2000 vegetation pixels. That gap
+        # is a *sampling* problem, not a loss-weighting one, so it is fixed on
+        # the data side: paste real rare instances, mix scans, and steer the
+        # crop window towards tail-class pixels.
+        instance_bank = None
+        cp_cfg = settings.copy_paste or {}
+        if cp_cfg.get('enabled', False):
+            from dataset.instance_bank import InstanceBank
+            instance_bank = InstanceBank(cp_cfg['bank_path'],
+                                         classes=cp_cfg.get('classes'))
+            if self.recorder is not None:
+                self.recorder.logger.info(
+                    'copy-paste instance bank: {}'.format(instance_bank.summary()))
+
         self.train_range_loader = dataset.RangeViewDataset(
             train_parser,
             image_size=settings.image_size,
             is_train=True,
             aug_cfg=settings.augmentation,
+            instance_bank=instance_bank,
+            copy_paste_cfg=cp_cfg,
+            mix_cfg=settings.mix,
+            rare_crop_p=settings.rare_crop_p,
+            rare_classes=settings.rare_classes,
             **common)
 
+        # 3-D point-wise validation needs the back-projection indices and the
+        # range images the KNN post-processing votes over.
         self.val_range_loader = dataset.RangeViewDataset(
             eval_parser,
             image_size=None,          # full-width images + sliding-window inference
             is_train=False,
+            return_points=settings.val_3d,
             **common)
 
         # Class weights for the focal loss. RangeViT weights SemanticKITTI by
         # point frequency and leaves nuScenes uniform.
         cls_freq = self.train_range_loader.cls_freq
         if settings.use_cls_freq_weights and cls_freq is not None:
-            self.cls_weight = 1 / (cls_freq + 1e-3)
+            self.cls_weight = 1 / (cls_freq + settings.cls_weight_eps)
         else:
             self.cls_weight = np.ones(settings.n_classes)
+        self.cls_freq = cls_freq
         self.ignore_class = [0]
         self.cls_weight[self.ignore_class] = 0
         for cl, w in enumerate(self.cls_weight):
@@ -140,6 +211,14 @@ class Trainer(object):
         if self.recorder is not None:
             self.recorder.logger.info('weight: {}'.format(self.cls_weight))
         self.mapped_cls_name = self.train_range_loader.mapped_cls_name
+
+        # Classes reported separately as the "tail". Defaults to the configured
+        # rare classes; falls back to the rarest third of the classes.
+        tail = list(settings.rare_classes or [])
+        if not tail and cls_freq is not None:
+            order = [c for c in np.argsort(cls_freq) if c not in self.ignore_class]
+            tail = sorted(order[:max(1, (settings.n_classes - 1) // 3)])
+        self.tail_classes = [int(c) for c in tail if c not in self.ignore_class]
 
         train_loader = torch.utils.data.DataLoader(
             self.train_range_loader,
@@ -159,18 +238,52 @@ class Trainer(object):
 
         return train_loader, val_loader
 
+    def _class_alpha(self):
+        """
+        Per-class weight of the focal term.
+
+        `log_inv` is RangeViT's: alpha = log(1 + 1/(freq + eps)), normalised.
+        With eps = 1e-3 it compresses a 5000:1 frequency gap into a 3.8:1 weight
+        gap, which is deliberately conservative. `salsanext` (1/log(1.02 + freq),
+        as in SalsaNext and Cylinder3D) gives ~10:1, and `inv_sqrt` (1/sqrt(freq))
+        is the aggressive end. Aggressive weighting on its own trades head-class
+        IoU for tail-class recall; it pays off once the tail classes are actually
+        present in the batch often enough, i.e. together with copy-paste.
+        """
+        scheme = self.settings.cls_weight_scheme
+        n = self.settings.n_classes
+        freq = self.cls_freq
+
+        if not self.settings.use_cls_freq_weights or freq is None or scheme == 'uniform':
+            alpha = np.ones(n)
+        elif scheme == 'log_inv':
+            alpha = np.log(1 + self.cls_weight)
+        elif scheme == 'salsanext':
+            alpha = 1.0 / np.log(1.02 + freq)
+        elif scheme == 'inv_sqrt':
+            alpha = 1.0 / np.sqrt(freq + 1e-8)
+        else:
+            raise ValueError(f'unknown cls_weight_scheme: {scheme}')
+
+        alpha = np.asarray(alpha, dtype=np.float64)
+        alpha[self.ignore_class] = 0
+        alpha = alpha / max(alpha.max(), 1e-12)
+        alpha[0] = 0
+        return alpha
+
     def _initCriterion(self):
         criterion = {}
         criterion['lovasz'] = utils.losses.Lovasz_softmax(ignore=0)
 
-        alpha = np.log(1 + self.cls_weight)
-        alpha = alpha / alpha.max()
-        alpha[0] = 0
+        alpha = self._class_alpha()
         if self.recorder is not None:
+            self.recorder.logger.info('focal_loss scheme: {}'.format(
+                self.settings.cls_weight_scheme))
             self.recorder.logger.info('focal_loss alpha: {}'.format(alpha))
 
         criterion['focal_loss'] = utils.losses.FocalSoftmaxLoss(
-            self.settings.n_classes, gamma=2, alpha=alpha, softmax=False)
+            self.settings.n_classes, gamma=self.settings.focal_gamma,
+            alpha=alpha, softmax=False)
 
         for _, v in criterion.items():
             v.to(self.device)
@@ -179,10 +292,21 @@ class Trainer(object):
     def compute_losses(self, output, output_softmax, label, mask):
         loss_lovasz = self.criterion['lovasz'](output_softmax, label)
         loss_focal = self.criterion['focal_loss'](output_softmax, label, mask=mask)
-        total_loss = loss_focal + loss_lovasz
+        # Lovasz is the term that optimises IoU directly, and it is the one that
+        # moves the tail classes; the focal term mostly keeps the head classes
+        # calibrated. Upweighting Lovasz is the cheapest loss-side knob here.
+        total_loss = (self.settings.focal_weight * loss_focal +
+                      self.settings.lovasz_weight * loss_lovasz)
         return total_loss, loss_lovasz, loss_focal
 
     def run(self, epoch, mode='Train', print_results=False):
+        """Validation always runs on the EMA weights when the EMA is enabled."""
+        if mode == 'Validation' and self.ema is not None and not self.settings.val_live_weights:
+            with self.ema.average_parameters(self.model):
+                return self._run(epoch, mode, print_results)
+        return self._run(epoch, mode, print_results)
+
+    def _run(self, epoch, mode='Train', print_results=False):
         if mode == 'Train':
             dataloader = self.train_loader
             self.model.train()
@@ -195,13 +319,20 @@ class Trainer(object):
         # Init metrics
         loss_meter = tools.AverageMeter()
         self.metrics.reset()
+        if self.metrics_3d is not None:
+            self.metrics_3d.reset()
         loss_lovasz = loss_focal = torch.zeros(1)
 
         total_iter = len(dataloader)
         t_start = time.time()
 
-        for i, (input_feature, input_label, input_mask) in enumerate(dataloader):
+        for i, batch in enumerate(dataloader):
             t_process_start = time.time()
+
+            # The validation loader also yields the back-projection data when
+            # 3-D validation is on; the training loader never does.
+            input_feature, input_label, input_mask = batch[0], batch[1], batch[2]
+            point_data = batch[3:] if len(batch) > 3 else None
 
             # Feature: range, x, y, z, intensity
             input_feature = input_feature.to(self.device)               # B x 5 x H x W
@@ -212,19 +343,37 @@ class Trainer(object):
             if mode == 'Train':
                 with tools.autocast(enabled=self.fp16_scaler is not None):
                     output = self.model(input_feature)
-                    output_softmax = F.softmax(output, dim=1)
-                    total_loss, loss_lovasz, loss_focal = self.compute_losses(
-                        output, output_softmax, input_label, input_mask)
+
+                # The losses run in fp32 even under AMP. Both are numerically
+                # fragile in half precision -- the focal term takes log() of a
+                # clamped probability (1e-6 is below the fp16 normal range) and
+                # Lovasz sorts per-pixel errors, so ties decided by fp16 rounding
+                # change the gradient. The instability shows up first on the
+                # tail classes, which are learnt from the fewest pixels.
+                output = output.float()
+                output_softmax = F.softmax(output, dim=1)
+                total_loss, loss_lovasz, loss_focal = self.compute_losses(
+                    output, output_softmax, input_label, input_mask)
 
                 # Backward
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 if self.fp16_scaler is None:
                     total_loss.backward()
+                    if self.settings.grad_clip > 0:
+                        nn.utils.clip_grad_norm_(self.trainable_params, self.settings.grad_clip)
                     self.optimizer.step()
                 else:
                     self.fp16_scaler.scale(total_loss).backward()
+                    if self.settings.grad_clip > 0:
+                        # Unscale before clipping, otherwise the threshold is
+                        # applied to gradients still carrying the loss scale.
+                        self.fp16_scaler.unscale_(self.optimizer)
+                        nn.utils.clip_grad_norm_(self.trainable_params, self.settings.grad_clip)
                     self.fp16_scaler.step(self.optimizer)
                     self.fp16_scaler.update()
+
+                if self.ema is not None:
+                    self.ema.update(self.model)
 
                 # Update lr after backward (required by pytorch)
                 self.scheduler.step()
@@ -241,7 +390,7 @@ class Trainer(object):
                             n_cls=self.settings.n_classes,
                             batch_size=1)
 
-                    output = lidar_pred.unsqueeze(0)     # [C, H, W] ==> [1, C, H, W]
+                    output = lidar_pred.unsqueeze(0).float()   # [C, H, W] ==> [1, C, H, W]
                     output_softmax = F.softmax(output, dim=1)
                     total_loss, loss_lovasz, loss_focal = self.compute_losses(
                         output, output_softmax, input_label, input_mask)
@@ -251,6 +400,18 @@ class Trainer(object):
             with torch.no_grad():
                 argmax = output.argmax(dim=1)
                 self.metrics.addBatch(argmax.cpu(), input_label.cpu())   # 2D predictions
+
+                if self.metrics_3d is not None and point_data is not None:
+                    px, py, point_labels, proj_range, unproj_range = point_data
+                    px_d, py_d = px[0].to(self.device), py[0].to(self.device)
+                    pred_2d = argmax[0]
+                    if self.val_knn is not None:
+                        pred_3d = self.val_knn(proj_range[0].to(self.device),
+                                               unproj_range[0].to(self.device),
+                                               pred_2d, px_d, py_d)
+                    else:
+                        pred_3d = pred_2d[py_d, px_d]
+                    self.metrics_3d.addBatch(pred_3d.cpu(), point_labels[0])
 
             loss_meter.update(loss.item(), input_feature.size(0))
 
@@ -300,6 +461,25 @@ class Trainer(object):
                 'conf_matrix': self.metrics.conf_matrix.clone().cpu(),
             }
 
+            # Mean IoU restricted to the tail classes, and the single worst
+            # class. Overall mIoU is dominated by the head classes and barely
+            # moves when a tail class collapses to zero, so it is the wrong
+            # quantity to select checkpoints on when the goal is to do well on
+            # *all* classes.
+            tail = [c for c in self.tail_classes if c not in self.ignore_class]
+            tail_iou = float(class_iou[tail].mean()) if tail else float(mean_iou)
+            scored = [(float(class_iou[c]), c) for c in range(self.settings.n_classes)
+                      if c not in self.ignore_class]
+            worst_iou, worst_cls = min(scored) if scored else (0.0, 0)
+
+            point_iou = point_tail_iou = None
+            point_class_iou = None
+            if self.metrics_3d is not None and self.metrics_3d.conf_matrix.sum() > 0:
+                p_mean_iou, point_class_iou = self.metrics_3d.getIoU()
+                point_iou = float(p_mean_iou)
+                point_tail_iou = (float(point_class_iou[tail].mean()) if tail
+                                  else point_iou)
+
         loss_dict = {
             'loss_meter_avg': loss_meter.avg,
             'loss_focal': float(loss_focal),
@@ -327,17 +507,65 @@ class Trainer(object):
                 self.recorder.tensorboard.add_scalar(f'{mode}/mean_iou', mean_iou.item(), epoch)
                 self.recorder.tensorboard.add_scalar(f'{mode}/mean_acc', mean_acc.item(), epoch)
 
-            self.recorder.log_wandb({
+            wandb_values = {
                 f'{mode}/loss': loss_dict['loss_meter_avg'],
                 f'{mode}/loss_focal': loss_dict['loss_focal'],
                 f'{mode}/loss_lovasz': loss_dict['loss_lovasz'],
                 f'{mode}/mean_iou': mean_iou.item(),
                 f'{mode}/mean_acc': mean_acc.item(),
                 f'{mode}/mean_recall': mean_recall.item(),
+                f'{mode}/tail_mean_iou': tail_iou,
+                f'{mode}/worst_class_iou': worst_iou,
                 'epoch': epoch + 1,
-            })
+            }
+            if point_iou is not None:
+                wandb_values[f'{mode}/point_mean_iou'] = point_iou
+                wandb_values[f'{mode}/point_tail_mean_iou'] = point_tail_iou
+                for cl, name in enumerate(self.mapped_cls_name):
+                    if cl not in self.ignore_class:
+                        wandb_values[f'{mode}/point_iou/{name}'] = float(point_class_iou[cl])
+            # Per-class IoU, so a collapsing tail class is visible the epoch it
+            # happens rather than only in the table printed every N epochs.
+            for cl, name in enumerate(self.mapped_cls_name):
+                if cl in self.ignore_class:
+                    continue
+                wandb_values[f'{mode}/iou/{name}'] = float(class_iou[cl])
+            self.recorder.log_wandb(wandb_values)
 
-        return {'mean_iou': mean_iou.item(), 'mean_acc': mean_acc.item()}
+            if mode == 'Validation':
+                self.recorder.logger.info(
+                    '>>> Validation mIoU {:.4f} | tail mIoU {:.4f} ({}) | worst {} {:.4f}'.format(
+                        mean_iou.item(), tail_iou,
+                        ','.join(self.mapped_cls_name[c] for c in self.tail_classes),
+                        self.mapped_cls_name[worst_cls], worst_iou))
+                if point_iou is not None:
+                    self.recorder.logger.info(
+                        '>>> Validation POINT mIoU {:.4f} | point tail mIoU {:.4f}  '
+                        '(pixel - point = {:+.4f})'.format(
+                            point_iou, point_tail_iou, mean_iou.item() - point_iou))
+                    eval_results(pixel_or_point='Point',
+                                 settings=self.settings,
+                                 recorder=self.recorder,
+                                 metrics_dict={
+                                     'mean_acc': self.metrics_3d.getAcc()[0],
+                                     'class_acc': self.metrics_3d.getAcc()[1],
+                                     'mean_recall': self.metrics_3d.getRecall()[0],
+                                     'class_recall': self.metrics_3d.getRecall()[1],
+                                     'mean_iou': self.metrics_3d.getIoU()[0],
+                                     'class_iou': point_class_iou,
+                                     'conf_matrix': self.metrics_3d.conf_matrix.clone().cpu(),
+                                 },
+                                 class_names=self.mapped_cls_name,
+                                 print_data_distribution=False) if print_results else None
+
+        results = {'mean_iou': mean_iou.item(), 'mean_acc': mean_acc.item(),
+                   'tail_mean_iou': tail_iou}
+        if point_iou is not None:
+            # The point-wise numbers are the ones comparable to the benchmark,
+            # so they get their own best_* checkpoints.
+            results['point_mean_iou'] = point_iou
+            results['point_tail_mean_iou'] = point_tail_iou
+        return results
 
 
 class Experiment(object):
@@ -371,6 +599,19 @@ class Experiment(object):
                 unfreeze_attn=self.settings.unfreeze_attn,
                 unfreeze_ffn=self.settings.unfreeze_ffn)
 
+        if self.settings.head_prior_bias:
+            freq = None
+            if self.settings.dataset == 'SemanticKitti':
+                from dataset.semantic_kitti import SemanticKITTI
+                freq = np.zeros(self.settings.n_classes)
+                for raw, content in SemanticKITTI.CONTENT.items():
+                    freq[SemanticKITTI.LABEL_MAP[raw]] += content
+            if freq is not None and model.initialize_head_bias(freq):
+                print('==> Classifier head bias initialised to the log class prior')
+            else:
+                print('==> head_prior_bias requested but no class frequencies are '
+                      'available for this dataset; head bias left at zero')
+
         if self.recorder is not None:
             self.recorder.logger.info(f'model = {model}')
             stats = model.counter_model_parameters()
@@ -401,6 +642,10 @@ class Experiment(object):
             raise FileNotFoundError('checkpoint file not found: {}'.format(self.settings.checkpoint))
 
         checkpoint_data = torch.load(self.settings.checkpoint, map_location='cpu')
+        # `checkpoint.pth` stores the live weights, which is what resuming needs.
+        # A `best_*` checkpoint stores the EMA weights instead -- resuming from
+        # one of those restarts training from the average, which is a slightly
+        # different run but not a broken one.
         msg = self.model.load_state_dict(checkpoint_data['model'], strict=True)
         print(f'{msg}')
 
@@ -410,18 +655,41 @@ class Experiment(object):
             self.epoch_start = checkpoint_data['epoch'] + 1
             if checkpoint_data.get('fp16_scaler') is not None and self.trainer.fp16_scaler is not None:
                 self.trainer.fp16_scaler.load_state_dict(checkpoint_data['fp16_scaler'])
+            if checkpoint_data.get('ema') is not None and self.trainer.ema is not None:
+                self.trainer.ema.load_state_dict(checkpoint_data['ema'])
+                print('==> Restored the EMA weights')
 
-    def _save_checkpoint(self, epoch, path, extra=None):
-        checkpoint_data = {
-            'model': self.model.state_dict(),
-            'optimizer': self.trainer.optimizer.state_dict(),
-            'epoch': epoch,
-        }
-        if self.trainer.fp16_scaler is not None:
-            checkpoint_data['fp16_scaler'] = self.trainer.fp16_scaler.state_dict()
-        if extra is not None:
-            checkpoint_data.update(extra)
-        torch.save(checkpoint_data, path)
+    def _save_checkpoint(self, epoch, path, extra=None, use_ema=True):
+        """
+        `model` holds the weights to evaluate. When the EMA is on, those are the
+        averaged weights -- the same ones validation was scored with, so the
+        checkpoint matches the number that selected it. The live weights go in
+        under `model_raw` so training can be resumed exactly.
+        """
+        ema = self.trainer.ema
+
+        def payload():
+            data = {
+                'model': self.model.state_dict(),
+                'optimizer': self.trainer.optimizer.state_dict(),
+                'epoch': epoch,
+            }
+            if ema is not None:
+                data['ema'] = ema.state_dict()
+            if self.trainer.fp16_scaler is not None:
+                data['fp16_scaler'] = self.trainer.fp16_scaler.state_dict()
+            if extra is not None:
+                data.update(extra)
+            return data
+
+        if ema is not None and use_ema:
+            # Serialise from inside the swap rather than cloning the state dict
+            # first: on DiT-XL/2 a clone is 2.7 GB of transient host memory, and
+            # `torch.save` already copies to host as it writes.
+            with ema.average_parameters(self.model):
+                torch.save(payload(), path)
+        else:
+            torch.save(payload(), path)
 
     def run(self):
         t_start = time.time()
@@ -454,9 +722,10 @@ class Experiment(object):
                             os.path.join(self.recorder.checkpoint_path, f'best_{k}_model.pth'),
                             extra={k: v})
 
-            # Save the last checkpoint
+            # Save the last checkpoint (live weights, for resuming)
             self._save_checkpoint(
-                epoch, os.path.join(self.recorder.checkpoint_path, 'checkpoint.pth'))
+                epoch, os.path.join(self.recorder.checkpoint_path, 'checkpoint.pth'),
+                use_ema=False)
 
             if best_val_result is not None:
                 log_str = '>>> Best Result: '
@@ -502,10 +771,33 @@ def parse_args():
                         help='validation frequency in epochs, type: int')
     parser.add_argument('--cond_mode', type=str, default=None, choices=['static', 'context'],
                         help='DiT conditioning mode')
+    parser.add_argument('--n_trunk_blocks', type=int, default=None,
+                        help='run only the first N DiT blocks (0 bypasses the trunk '
+                             'entirely -- the ablation that says whether the '
+                             'pre-trained trunk earns its place)')
+    parser.add_argument('--val_3d', action='store_true',
+                        help='also compute point-wise (3-D) validation mIoU -- the metric '
+                             'the benchmark scores, and the one to select checkpoints on')
+    parser.add_argument('--val_knn', action='store_true',
+                        help='apply KNN post-processing during 3-D validation, so the '
+                             'validation number matches the final evaluation')
+    parser.add_argument('--grad_checkpointing', action='store_true',
+                        help='recompute DiT block activations instead of storing them')
     parser.add_argument('--unfreeze_attn', action='store_true',
                         help='also train the DiT attention layers')
     parser.add_argument('--unfreeze_ffn', action='store_true',
                         help='also train the DiT feed-forward layers')
+    parser.add_argument('--ema_decay', type=float, default=None,
+                        help='EMA decay of the trainable weights (0 disables)')
+    parser.add_argument('--rare_crop_p', type=float, default=None,
+                        help='probability of centring the training crop on a tail-class pixel')
+    parser.add_argument('--cls_weight_scheme', type=str, default=None,
+                        choices=['log_inv', 'salsanext', 'inv_sqrt', 'uniform'],
+                        help='per-class weighting of the focal term')
+    parser.add_argument('--lovasz_weight', type=float, default=None,
+                        help='weight of the Lovasz-softmax term')
+    parser.add_argument('--cond_timestep', type=int, default=None,
+                        help='diffusion timestep the frozen t_embedder is evaluated at')
     parser.add_argument('--use_wandb', action='store_true', help='enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default=None, help='Weights & Biases project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/team')

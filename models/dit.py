@@ -249,6 +249,40 @@ class FinalModulation(nn.Module):
         return modulate(self.norm_final(x), shift, scale)
 
 
+class LayerTapFusion(nn.Module):
+    """
+    Zero-initialised residual injection of intermediate DiT blocks.
+
+    A diffusion trunk is not a classifier: its last blocks are specialised for
+    predicting *noise*, which is a high-frequency, low-semantics target. The
+    features that separate object categories sit in the middle of the stack
+    (this is the central finding of DDPM-Seg, Baranchuk et al. ICLR 2022, and it
+    is why every frozen-diffusion-backbone segmenter taps several depths rather
+    than only the output). Reading only `blocks[-1]`, as the plain encoder does,
+    is therefore likely to be reading the trunk at its least useful depth.
+
+    The fusion is written as `last + proj(concat(norm(tap) for taps))` with
+    `proj` zero-initialised, so at initialisation the encoder output is bitwise
+    the output of the last block -- the same trick adaLN-Zero and `cond_offset`
+    use elsewhere in this repository. Training starts from exactly the current
+    model and learns how much of the intermediate depths to pull in.
+    """
+
+    def __init__(self, d_model, n_taps):
+        super().__init__()
+        # Per-tap LayerNorm: the residual stream grows in scale with depth, so
+        # raw activations from block 6 and block 21 are not comparable.
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(d_model, eps=1e-6) for _ in range(n_taps)])
+        self.proj = nn.Linear(d_model * n_taps, d_model)
+        nn.init.constant_(self.proj.weight, 0)
+        nn.init.constant_(self.proj.bias, 0)
+
+    def forward(self, last, taps):
+        h = torch.cat([norm(t) for norm, t in zip(self.norms, taps)], dim=-1)
+        return last + self.proj(h)
+
+
 # --------------------------------------------------------------------------- #
 #                        DiT encoder for segmentation                         #
 # --------------------------------------------------------------------------- #
@@ -282,6 +316,7 @@ class DiTEncoder(nn.Module):
         conv_stem='ConvStem',
         stem_base_channels=32,
         stem_hidden_dim=None,
+        stem_pool='avg',
         dit_num_classes=1000,
         class_dropout_prob=0.1,
         cond_timestep=0.0,
@@ -289,6 +324,9 @@ class DiTEncoder(nn.Module):
         learnable_cond=True,
         cond_mode='static',
         learnable_pos_emb=True,
+        feature_taps=None,
+        n_trunk_blocks=None,
+        grad_checkpointing=False,
     ):
         super().__init__()
         from .stems import ConvStem, PatchEmbedding  # local import: avoids a cycle
@@ -307,7 +345,8 @@ class DiTEncoder(nn.Module):
                 patch_stride=patch_stride,
                 embed_dim=d_model,
                 flatten=True,
-                hidden_dim=stem_hidden_dim)
+                hidden_dim=stem_hidden_dim,
+                pool=stem_pool)
 
         self.image_size = image_size
         self.patch_size = tuple(patch_size)
@@ -354,6 +393,32 @@ class DiTEncoder(nn.Module):
 
         self.final_layer = FinalModulation(d_model)
 
+        # ---- How much of the trunk to run, and where to read it ----
+        # `n_trunk_blocks` truncates the stack (0 bypasses it entirely, which is
+        # the ablation that says whether the pre-trained trunk earns its place).
+        self.n_trunk_blocks = n_layers if n_trunk_blocks is None else int(n_trunk_blocks)
+        if not 0 <= self.n_trunk_blocks <= n_layers:
+            raise ValueError(f'n_trunk_blocks must be in [0, {n_layers}], '
+                             f'got {n_trunk_blocks}')
+
+        taps = sorted({int(t) for t in (feature_taps or [])})
+        last_used = self.n_trunk_blocks - 1
+        for t in taps:
+            if not 0 <= t < self.n_trunk_blocks:
+                raise ValueError(f'feature_tap {t} is outside the {self.n_trunk_blocks} '
+                                 f'blocks actually run')
+        # The final block is always read; listing it as a tap would double it.
+        self.feature_taps = [t for t in taps if t != last_used]
+        self.fusion = (LayerTapFusion(d_model, len(self.feature_taps))
+                       if self.feature_taps else None)
+
+        # Gradient checkpointing on the trunk. Freezing the blocks does *not*
+        # save activation memory: the stem sits upstream of them, so backprop
+        # still has to traverse all 28 blocks and every activation is retained.
+        # Recomputing them instead is what makes a finer token grid or an
+        # unfrozen trunk fit at all.
+        self.grad_checkpointing = grad_checkpointing
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -385,6 +450,7 @@ class DiTEncoder(nn.Module):
             names.add('cond_offset')
         return names
 
+
     def get_grid_size(self, H, W):
         return self.patch_embed.get_grid_size(H, W)
 
@@ -414,8 +480,31 @@ class DiTEncoder(nn.Module):
         x = self.dropout(x + pos_embed)
 
         c = self.get_conditioning(x)
-        for blk in self.blocks:
-            x = blk(x, c)
+
+        taps = []
+        for i in range(self.n_trunk_blocks):
+            blk = self.blocks[i]
+            if self.grad_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(blk, x, c, use_reentrant=False)
+            else:
+                x = blk(x, c)
+            if i in self.feature_taps:
+                taps.append(x)
+
+        if self.fusion is not None:
+            x = self.fusion(x, taps)
 
         x = self.final_layer(x, c)
         return x, skip
+
+    def truncate_blocks(self):
+        """
+        Physically drop the blocks that `n_trunk_blocks` does not run.
+
+        Called after the pre-trained weights are loaded, so the checkpoint still
+        matches by key. On DiT-XL/2 every dropped block frees ~24 M frozen
+        parameters of VRAM that would otherwise sit there unused.
+        """
+        if self.n_trunk_blocks < len(self.blocks):
+            self.blocks = nn.ModuleList(list(self.blocks)[:self.n_trunk_blocks])
+        return self

@@ -22,6 +22,7 @@ Pre-trained weights come from the official DiT release
 correspond to the `DiT-XL/2` configuration.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -80,8 +81,10 @@ class RangeDiT(nn.Module):
         conv_stem='ConvStem',
         stem_base_channels=32,
         stem_hidden_dim=256,
+        stem_pool='avg',
         skip_filters=0,
         decoder='up_conv',
+        decoder_stages=1,
         up_conv_d_decoder=64,
         up_conv_scale_factor=(2, 8),
         dropout=0.0,
@@ -91,6 +94,9 @@ class RangeDiT(nn.Module):
         learnable_cond=True,
         cond_mode='static',
         learnable_pos_emb=True,
+        feature_taps=None,
+        n_trunk_blocks=None,
+        grad_checkpointing=False,
     ):
         super().__init__()
 
@@ -118,11 +124,15 @@ class RangeDiT(nn.Module):
             conv_stem=conv_stem,
             stem_base_channels=stem_base_channels,
             stem_hidden_dim=stem_hidden_dim,
+            stem_pool=stem_pool,
             cond_timestep=cond_timestep,
             cond_class=cond_class,
             learnable_cond=learnable_cond,
             cond_mode=cond_mode,
-            learnable_pos_emb=learnable_pos_emb)
+            learnable_pos_emb=learnable_pos_emb,
+            feature_taps=feature_taps,
+            n_trunk_blocks=n_trunk_blocks,
+            grad_checkpointing=grad_checkpointing)
 
         # ---- Segmentation decoder ----
         if decoder == 'linear':
@@ -140,7 +150,8 @@ class RangeDiT(nn.Module):
                 d_decoder=up_conv_d_decoder,
                 scale_factor=tuple(up_conv_scale_factor),
                 patch_stride=encoder.patch_stride,
-                skip_filters=skip_filters)
+                skip_filters=skip_filters,
+                stages=decoder_stages)
         else:
             raise ValueError(f'Unknown decoder: {decoder}')
 
@@ -157,6 +168,45 @@ class RangeDiT(nn.Module):
                 reuse_pos_emb=reuse_pos_emb,
                 reuse_patch_emb=reuse_patch_emb,
                 conv_stem=conv_stem)
+
+        # Drop the blocks `n_trunk_blocks` does not run -- after loading, so the
+        # checkpoint still matches by key.
+        encoder.truncate_blocks()
+
+    # ------------------------------------------------------------------ #
+
+    def initialize_head_bias(self, cls_freq, ignore_index=0):
+        """
+        Initialise the classifier bias to the log class prior (the RetinaNet
+        trick).
+
+        A default-initialised head starts by predicting a near-uniform
+        distribution over 20 classes. On the first steps the loss is dominated
+        by pushing the ~99.9 % of pixels that are head classes away from that
+        uniform prediction, and the gradient that reaches the rare classes is
+        swamped -- they are often driven to near-zero logits before they are
+        ever learnt, which is the collapse that leaves motorcyclist at 0.0 IoU
+        for an entire run. Starting the bias at the prior means the head begins
+        where that pressure has already been resolved, and the weights only have
+        to learn the deviation from the prior.
+        """
+        head = getattr(self.rangedit.decoder, 'head', None)
+        if head is None or head.bias is None:
+            return False
+
+        freq = np.asarray(cls_freq, dtype=np.float64).copy()
+        if freq.shape[0] != head.bias.shape[0]:
+            return False
+        freq[ignore_index] = 0.0
+        total = freq.sum()
+        if total <= 0:
+            return False
+        prior = np.clip(freq / total, 1e-8, None)
+
+        with torch.no_grad():
+            head.bias.copy_(torch.from_numpy(np.log(prior)).to(head.bias.dtype))
+            head.bias[ignore_index] = float(np.log(1e-8))
+        return True
 
     # ------------------------------------------------------------------ #
     #                     Pre-trained weight loading                     #

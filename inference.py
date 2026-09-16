@@ -23,6 +23,7 @@ import utils
 from option import Option
 from train import build_rangedit_model
 from utils.inference import sliding_window_inference
+from utils.knn import KNNPostProcess
 from utils.tools import Recorder, eval_results
 
 
@@ -47,6 +48,19 @@ def parse_args():
                         help='sliding window stride along the width, type: int')
     parser.add_argument('--save_eval_results', action='store_true',
                         help='write the per-point predictions in the benchmark format')
+    parser.add_argument('--knn', action='store_true',
+                        help='KNN post-processing of the back-projected 3-D labels '
+                             '(RangeNet++). Fixes the labels of the points the '
+                             'projection discards; only affects the 3-D metric.')
+    parser.add_argument('--knn_k', type=int, default=5, help='neighbours that vote')
+    parser.add_argument('--knn_search', type=int, default=5,
+                        help='side of the pixel window searched (odd)')
+    parser.add_argument('--knn_sigma', type=float, default=1.0,
+                        help='width of the spatial prior')
+    parser.add_argument('--knn_cutoff', type=float, default=1.0,
+                        help='max range difference (m) for a neighbour to vote')
+    parser.add_argument('--flip_tta', action='store_true',
+                        help='average the logits with those of the azimuth-flipped scan')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
     args = parser.parse_args()
     args.test_split = (args.split == 'test')
@@ -124,6 +138,15 @@ def main():
     metrics_3d = utils.metrics.IOUEval(n_classes=settings.n_classes,
                                        device=torch.device('cpu'), ignore=[0])
 
+    knn = None
+    if args.knn:
+        knn = KNNPostProcess(n_classes=settings.n_classes, knn=args.knn_k,
+                             search=args.knn_search, sigma=args.knn_sigma,
+                             cutoff=args.knn_cutoff).to(device)
+        recorder.logger.info(
+            f'KNN post-processing: k={args.knn_k} search={args.knn_search} '
+            f'sigma={args.knn_sigma} cutoff={args.knn_cutoff}')
+
     prediction_path = os.path.join(settings.save_path, 'preds')
     total_iter = len(loader)
     t_start = time.time()
@@ -131,7 +154,8 @@ def main():
     recorder.logger.info(f'Evaluating on {len(eval_ds)} scans '
                          f'(window {settings.window_size}, stride {settings.window_stride})...')
 
-    for i, (feature, label_2d, mask, px, py, point_labels) in enumerate(loader):
+    for i, (feature, label_2d, mask, px, py, point_labels,
+            proj_range, unproj_range) in enumerate(loader):
         feature = feature.to(device)
 
         with torch.no_grad():
@@ -142,11 +166,30 @@ def main():
                 n_cls=settings.n_classes,
                 batch_size=1)
 
-        pred_2d = logits.argmax(dim=0).cpu()                     # (H, W)
+            if args.flip_tta:
+                # A spinning LiDAR has no preferred handedness, so mirroring the
+                # range image along the azimuth is a label-preserving view.
+                flipped = sliding_window_inference(
+                    model, torch.flip(feature, dims=[3]),
+                    window_size=settings.window_size,
+                    window_stride=settings.window_stride,
+                    n_cls=settings.n_classes,
+                    batch_size=1)
+                logits = 0.5 * (logits + torch.flip(flipped, dims=[2]))
+
+        pred_2d = logits.argmax(dim=0)                           # (H, W) on device
 
         # Back-project the 2-D predictions to per-point 3-D labels
-        px_np, py_np = px[0].numpy(), py[0].numpy()
-        pred_3d = pred_2d.numpy()[py_np, px_np]                  # (N,)
+        px_dev, py_dev = px[0].to(device), py[0].to(device)
+        if knn is not None:
+            # The projection keeps only the closest point per pixel, so every
+            # occluded point would otherwise inherit the label of whatever was
+            # in front of it. KNN re-labels each point by a range-weighted vote.
+            pred_3d = knn(proj_range[0].to(device), unproj_range[0].to(device),
+                          pred_2d, px_dev, py_dev).cpu().numpy()
+        else:
+            pred_3d = pred_2d[py_dev, px_dev].cpu().numpy()      # (N,)
+        pred_2d = pred_2d.cpu()
 
         if not args.test_split:
             gt_3d = point_labels[0].numpy()

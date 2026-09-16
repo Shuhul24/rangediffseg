@@ -63,7 +63,8 @@ class ConvStem(nn.Module):
                  patch_stride=(2, 8),
                  embed_dim=1152,
                  flatten=True,
-                 hidden_dim=None):
+                 hidden_dim=None,
+                 pool='avg'):
         super().__init__()
 
         if hidden_dim is None:
@@ -83,9 +84,38 @@ class ConvStem(nn.Module):
         assert patch_stride[1] % 2 == 0
         kernel_size = (patch_stride[0] + 1, patch_stride[1] + 1)
         padding = (patch_stride[0] // 2, patch_stride[1] // 2)
-        self.proj_block = nn.Sequential(
-            nn.AvgPool2d(kernel_size=kernel_size, stride=tuple(patch_stride), padding=padding),
-            nn.Conv2d(hidden_dim, embed_dim, kernel_size=1))
+        self.pool = pool
+
+        # How full-resolution stem features are reduced to the token grid.
+        #
+        # 'avg' is RangeViT's: a fixed uniform average over a 3 x 9 window. That
+        # is a low-pass filter applied right before the trunk, and it is applied
+        # to the one signal small objects have -- a 3-pixel-wide pole is averaged
+        # into its background and never reaches the transformer as anything
+        # distinct. 'dwconv' replaces it with a depthwise strided convolution,
+        # *initialised to the same uniform 1/(k0*k1) kernel*, so the model starts
+        # bitwise where 'avg' starts and can then learn a per-channel kernel that
+        # preserves thin structure. It costs hidden_dim * k0 * k1 parameters
+        # (~7 k at D_h=256), which is nothing.
+        if pool == 'avg':
+            reduce_layers = [nn.AvgPool2d(kernel_size=kernel_size,
+                                          stride=tuple(patch_stride), padding=padding),
+                             nn.Conv2d(hidden_dim, embed_dim, kernel_size=1)]
+        elif pool == 'dwconv':
+            dw = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size,
+                           stride=tuple(patch_stride), padding=padding,
+                           groups=hidden_dim, bias=False)
+            nn.init.constant_(dw.weight, 1.0 / float(kernel_size[0] * kernel_size[1]))
+            reduce_layers = [dw, nn.Conv2d(hidden_dim, embed_dim, kernel_size=1)]
+        elif pool == 'conv':
+            # Fully learnt patchification. Most expressive, but hidden_dim x
+            # embed_dim x k0 x k1 is ~8 M parameters at D_h=256 -- it roughly
+            # doubles the default trainable budget on its own.
+            reduce_layers = [nn.Conv2d(hidden_dim, embed_dim, kernel_size=kernel_size,
+                                       stride=tuple(patch_stride), padding=padding)]
+        else:
+            raise ValueError(f"Unknown stem pool: {pool} (use 'avg', 'dwconv' or 'conv')")
+        self.proj_block = nn.Sequential(*reduce_layers)
 
         self.patch_stride = tuple(patch_stride)
         self.patch_size = tuple(patch_stride)

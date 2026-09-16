@@ -51,6 +51,34 @@ dataset:
     p_scale:         0.0
     scale_range:     [0.95, 1.05]
 
+    # -- Sensor-level augmentation --
+    p_drop_points:   0.5
+    drop_points_range: [0.0, 0.2]
+    p_intensity_jitter: 0.5
+    intensity_scale_range: [0.9, 1.1]
+    intensity_noise_sigma: 0.01
+    p_drop_intensity: 0.05
+
+  # ─── Tail-class handling ───────────────────────────────────────────────
+  # bicycle, bus, construction_vehicle, motorcycle, pedestrian, traffic_cone,
+  # trailer, other_flat. nuScenes-lidarseg is less skewed than SemanticKITTI
+  # but these are still the classes that decide the mIoU.
+  rare_classes: [2, 3, 5, 6, 7, 8, 9, 12]
+  rare_crop_p: 0.5
+
+  cls_weight_scheme: uniform
+
+  # nuScenes-lidarseg ships no panoptic instance ids, so instances cannot be cut
+  # out exactly -- use scan mixing instead of copy-paste here.
+  copy_paste:
+    enabled: false
+
+  mix:
+    p_lasermix: 0.0
+    p_polarmix: 0.0
+    lasermix_bands: [2, 3, 4]
+    polarmix_sector_range: [0.7854, 3.1416]
+
 # ─────────────────────────────────────────────────────────────
 model:
   # ---- Pre-trained DiT trunk ----
@@ -78,6 +106,16 @@ model:
   learnable_cond: true
   cond_mode:      static
 
+  decoder_stages: 1
+  stem_pool:      avg
+
+  # ---- How much of the trunk to run, and where features are read from ----
+  # See config.yaml and README §7b.
+  feature_taps: []
+  n_trunk_blocks: null
+  grad_checkpointing: false
+  head_prior_bias: false
+
   # ---- Which parts of the trunk are trained ----
   freeze_dit_encoder: true
   unfreeze_adaln:     true
@@ -102,6 +140,24 @@ training:
   weight_decay:   0.01
   warmup_epochs:  10
   use_fp16:       true
+  grad_clip:        1.0
+  ema_decay:        0.999
+  ema_warmup_steps: 2000
+  focal_gamma:      2.0
+  focal_weight:     1.0
+  lovasz_weight:    1.0
+  # ---- Validation ----
+  # The 2-D pixel metric is a proxy: the projection keeps one point per pixel, so
+  # it is blind to the 10-20 % of points it discards -- and blind to them
+  # unevenly, since thin and occluded classes lose the most. `val_3d` also scores
+  # the point-wise mIoU (the benchmark metric) and saves its own best_* files.
+  # `val_knn` makes that number match what inference.py --knn will report.
+  val_3d:   false
+  val_knn:  false
+  knn_k:      5
+  knn_search: 5
+  knn_sigma:  1.0
+  knn_cutoff: 1.0
   val_frequency:  10
   train_result_frequency: 100
   log_frequency:  100

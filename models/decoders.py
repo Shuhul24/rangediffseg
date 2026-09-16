@@ -114,23 +114,58 @@ class UpConvBlock(nn.Module):
 
 
 class DecoderUpConv(nn.Module):
-    """Convolutional decoder: token grid -> full-resolution class logits."""
+    """
+    Convolutional decoder: token grid -> full-resolution class logits.
+
+    `stages=1` is RangeViT's: one 2x8 pixel shuffle takes a 32x48 token grid
+    straight to 64x384, with the full-resolution stem features as the only skip.
+    That is a 16x area upsample decided by a single 1x1 convolution, and it is
+    the only place a 3-pixel-wide pole can be reconstructed -- the trunk resolves
+    nothing below one 2x8 token.
+
+    `stages=2` splits it into (s0, s1/2) followed by (1, 2), and gives the first
+    stage its own skip at the intermediate width, produced by striding the
+    full-resolution stem features down inside the decoder. The stem interface is
+    unchanged. It is also *cheaper*: the wide 1x1 that produces
+    `d_decoder * s0 * s1` channels is replaced by two narrower ones.
+    """
 
     def __init__(self, n_cls, patch_size, d_encoder, d_decoder, scale_factor=(2, 8),
-                 patch_stride=None, dropout_rate=0.2, drop_out=False, skip_filters=0):
+                 patch_stride=None, dropout_rate=0.2, drop_out=False, skip_filters=0,
+                 stages=1):
         super().__init__()
         self.d_encoder = d_encoder
         self.d_decoder = d_decoder
         self.patch_size = patch_size
         self.patch_stride = patch_stride
         self.n_cls = n_cls
+        self.stages = int(stages)
+        self.skip_filters = skip_filters
 
-        self.up_conv_block = UpConvBlock(
-            d_encoder, d_decoder,
-            dropout_rate=dropout_rate,
-            scale_factor=scale_factor,
-            drop_out=drop_out,
-            skip_filters=skip_filters)
+        if self.stages == 1:
+            self.up_conv_block = UpConvBlock(
+                d_encoder, d_decoder,
+                dropout_rate=dropout_rate,
+                scale_factor=scale_factor,
+                drop_out=drop_out,
+                skip_filters=skip_filters)
+        elif self.stages == 2:
+            s0, s1 = scale_factor
+            if s1 % 2 != 0:
+                raise ValueError(f'decoder_stages=2 needs an even width scale, got {s1}')
+            self.up1 = UpConvBlock(
+                d_encoder, d_decoder, dropout_rate=dropout_rate,
+                scale_factor=(s0, s1 // 2), drop_out=drop_out, skip_filters=skip_filters)
+            self.up2 = UpConvBlock(
+                d_decoder, d_decoder, dropout_rate=dropout_rate,
+                scale_factor=(1, 2), drop_out=drop_out, skip_filters=skip_filters)
+            # Full-resolution stem features -> the intermediate width, so the
+            # first stage also gets a skip instead of upsampling blind.
+            self.skip_down = (nn.Conv2d(skip_filters, skip_filters, kernel_size=(1, 3),
+                                        stride=(1, 2), padding=(0, 1))
+                              if skip_filters > 0 else None)
+        else:
+            raise ValueError(f'decoder_stages must be 1 or 2, got {stages}')
 
         self.head = nn.Conv2d(d_decoder, n_cls, kernel_size=(1, 1))
         self.apply(init_weights)
@@ -143,5 +178,12 @@ class DecoderUpConv(nn.Module):
         H, W = im_size
         GS_H, GS_W = get_grid_size_2d(H, W, self.patch_size, self.patch_stride)
         x = tokens_to_map(x, GS_H, GS_W)
-        x = self.up_conv_block(x, skip)
+
+        if self.stages == 1:
+            x = self.up_conv_block(x, skip)
+        else:
+            skip_mid = self.skip_down(skip) if self.skip_down is not None else None
+            x = self.up1(x, skip_mid)
+            x = self.up2(x, skip)
+
         return x if return_features else self.head(x)

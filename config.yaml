@@ -36,6 +36,61 @@ dataset:
     p_scale:         0.5
     scale_range:     [0.95, 1.05]
 
+    # -- Sensor-level augmentation (off in the RangeViT recipe) -------------
+    # Random point dropout simulates a sparser / partly occluded sensor. It is
+    # one of the few augmentations that helps thin structures (pole,
+    # traffic-sign, trunk), which otherwise get learnt only at the exact point
+    # density of the training LiDAR.
+    p_drop_points:   0.5
+    drop_points_range: [0.0, 0.2]
+    # Intensity is the channel that transfers worst across sequences, so it is
+    # the easiest one to overfit; jittering it pushes the decision onto geometry.
+    p_intensity_jitter: 0.5
+    intensity_scale_range: [0.9, 1.1]
+    intensity_noise_sigma: 0.01
+    p_drop_intensity: 0.05
+    p_jitter_xyz:    0.0
+    jitter_xyz_sigma: 0.02
+
+  # ─── Tail-class handling ───────────────────────────────────────────────
+  # bicycle, motorcycle, truck, other-vehicle, person, bicyclist, motorcyclist,
+  # trunk, pole, traffic-sign. Used to steer the training crop and to report a
+  # separate `tail_mean_iou`.
+  rare_classes: [2, 3, 4, 5, 6, 7, 8, 16, 18, 19]
+
+  # Probability of centring the 64x384 training crop on a tail-class pixel
+  # instead of cropping uniformly. A uniform crop of a 64x2048 image holds ~1
+  # bicycle pixel against ~2000 vegetation pixels; this is the cheapest fix for
+  # that gap, and costs nothing at inference.
+  rare_crop_p: 0.5
+
+  # Focal-loss class weighting.
+  #   log_inv   : RangeViT's log(1 + 1/(freq + eps))       -> 3.8:1 rare:road
+  #   salsanext : 1/log(1.02 + freq)  (SalsaNext/Cylinder3D) -> 10:1
+  #   inv_sqrt  : 1/sqrt(freq), the aggressive end
+  #   uniform   : no weighting
+  cls_weight_scheme: log_inv
+  cls_weight_eps:    1.0e-3
+
+  # Copy-paste of real rare-class instances, cut out using the panoptic instance
+  # ids in the SemanticKITTI .label files. Build the bank once with:
+  #   python -m dataset.instance_bank --data_root <root>   #       --out ./cache/instance_bank_kitti.npz
+  copy_paste:
+    enabled:     false
+    bank_path:   ./cache/instance_bank_kitti.npz
+    classes:     [2, 3, 4, 5, 6, 7, 8]   # thing classes with instance ids
+    p:           0.8                     # fraction of scans that get pastes
+    n_instances: [1, 4]                  # how many per scan
+    occlusion_tolerance: 0.5             # reject placements buried behind geometry
+
+  # Scan-level mixing. Works on both datasets (no instance ids needed), but
+  # costs one extra scan read per mixed sample -- raise num_workers with it.
+  mix:
+    p_lasermix: 0.0        # swap inclination bands with another scan
+    p_polarmix: 0.0        # swap azimuth sectors with another scan
+    lasermix_bands: [3, 4, 5, 6]
+    polarmix_sector_range: [0.7854, 3.1416]
+
 # ─────────────────────────────────────────────────────────────
 model:
   # ---- Pre-trained DiT trunk ----
@@ -49,6 +104,13 @@ model:
   patch_stride:       [2, 8]
   conv_stem:          ConvStem          # 'ConvStem' or 'none' (plain patch embedding)
   stem_base_channels: 32
+  stem_pool:          avg               # how full-res stem features become tokens:
+                                        # 'avg'    = RangeViT's fixed 3x9 average pool
+                                        #            (a low-pass filter right before
+                                        #            the trunk -- it erases thin objects)
+                                        # 'dwconv' = depthwise strided conv, initialised
+                                        #            to exactly that average (+7 k params)
+                                        # 'conv'   = fully learnt patchification (+8 M)
   D_h:                256               # hidden dim of the stem and of the decoder
   reuse_pos_emb:      true              # resize DiT's 16x16 sin-cos grid to 32x48
   reuse_patch_emb:    false             # only possible with conv_stem: none
@@ -56,6 +118,11 @@ model:
 
   # ---- Decoder ----
   decoder:      up_conv                 # 'up_conv' or 'linear'
+  decoder_stages: 1                     # 1 = RangeViT's single 2x8 pixel shuffle.
+                                        # 2 splits it into (2,4) then (1,2) and gives
+                                        # the first stage its own skip -- a 3-pixel
+                                        # pole has somewhere to be reconstructed.
+                                        # On DiT-XL/2 it is also 0.8 M *cheaper*.
   skip_filters: 256                     # stem -> decoder skip connection (0 = off, else = D_h)
 
   # ---- adaLN-Zero conditioning of the DiT blocks ----
@@ -67,6 +134,29 @@ model:
   learnable_cond: true                  # learn an offset on top of it
   cond_mode:      static                # 'static', or 'context' to also condition
                                         # on the pooled stem features of the scan
+
+  # ---- How much of the trunk to run, and where features are read from ----
+  # A diffusion trunk is not a classifier: its last blocks are specialised for
+  # predicting noise, which is high-frequency and low-semantics. The features
+  # that separate categories sit mid-stack. `feature_taps` fuses extra block
+  # outputs into the encoder output through a zero-initialised projection, so
+  # [] reproduces the plain model exactly and training starts from it.
+  # For DiT-XL/2 (28 blocks) try [6, 13, 20].
+  feature_taps: []
+
+  # Run only the first N blocks. `null` = all of them; `0` bypasses the trunk
+  # entirely (stem -> decoder), which is the ablation that tells you whether the
+  # pre-trained trunk earns its 677 M parameters at all. Run that first.
+  n_trunk_blocks: null
+
+  # Recompute block activations in the backward pass instead of storing them.
+  # Freezing the trunk does NOT free most of this memory (see README §7b), and
+  # this is what makes patch_stride [2,4] or an unfrozen trunk fit.
+  grad_checkpointing: false
+
+  # Initialise the classifier bias to the log class prior (RetinaNet trick), so
+  # the head starts at the data distribution instead of uniform over 20 classes.
+  head_prior_bias: false
 
   # ---- Which parts of the trunk are trained ----
   # DiT LayerNorms have elementwise_affine=False, so the counterpart of
@@ -96,7 +186,34 @@ training:
   weight_decay:   0.01
   warmup_epochs:  2
   use_fp16:       true
+  # ---- Validation ----
+  # The 2-D pixel metric is a proxy: the projection keeps one point per pixel, so
+  # it is blind to the 10-20 % of points it discards -- and blind to them
+  # unevenly, since thin and occluded classes lose the most. `val_3d` also scores
+  # the point-wise mIoU (the benchmark metric) and saves its own best_* files.
+  # `val_knn` makes that number match what inference.py --knn will report.
+  val_3d:   false
+  val_knn:  false
+  knn_k:      5
+  knn_search: 5
+  knn_sigma:  1.0
+  knn_cutoff: 1.0
   val_frequency:  5                       # run validation every N epochs
+
+  # ---- Stability / regularisation ----
+  grad_clip:      1.0     # 0 disables. Rare-class focal gradients spike; clipping
+                          # them costs nothing and prevents a bad batch from
+                          # undoing an epoch of tail-class progress.
+  ema_decay:      0.999   # 0 disables. Validation and the best_* checkpoints use
+                          # the averaged weights.
+  ema_warmup_steps: 2000
+  val_live_weights: false # true = validate the live weights even when EMA is on
+
+  # ---- Loss ----
+  focal_gamma:    2.0
+  focal_weight:   1.0
+  lovasz_weight:  1.0     # Lovasz optimises IoU directly and is what moves the
+                          # tail classes; 1.5-3.0 is worth a sweep.
   train_result_frequency: 10              # print the per-class train table every N epochs
   log_frequency:  100                     # print a log line every N iterations
   num_workers:    4
