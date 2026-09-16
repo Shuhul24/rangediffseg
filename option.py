@@ -120,6 +120,11 @@ class Option(object):
         self.aux_heads = m_cfg.get('aux_heads', True)
         self.aux_weight = m_cfg.get('aux_weight', 0.4)
         self.grad_clip = t_cfg.get('grad_clip', 1.0)
+        d_cfg = self.config.get('diffusion', {}) or {}
+        self.diffusion_loss_weight = d_cfg.get('loss_weight', 0.0)
+        self.diffusion_timesteps = d_cfg.get('timesteps', 1000)
+        self.diffusion_schedule = d_cfg.get('schedule', 'cosine')
+        self.diffusion_t_max_frac = d_cfg.get('t_max_frac', 0.25)
         self.distributed = False
         self.rank = 0
         self.local_rank = 0

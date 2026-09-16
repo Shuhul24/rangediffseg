@@ -29,9 +29,9 @@ from utils.tools import Recorder, eval_results
 
 def parse_args():
     parser = argparse.ArgumentParser(description='RangeDiT evaluation options')
-    parser.add_argument('config_path', type=str, nargs='?', default='config.yaml',
+    parser.add_argument('config_pos', type=str, nargs='?', default=None,
                         help='path of the config file, type: string')
-    parser.add_argument('--config', dest='config_path',
+    parser.add_argument('--config', dest='config_opt', type=str, default=None,
                         help='path of the config file (alias of the positional argument)')
     parser.add_argument('--data_root', type=str, default=None,
                         help='path to the dataset root, type: string')
@@ -64,6 +64,7 @@ def parse_args():
                         help='reject neighbours further than this in range (metres)')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
     args = parser.parse_args()
+    args.config_path = args.config_opt or args.config_pos or 'config.yaml'
     args.test_split = (args.split == 'test')
     args.val_only = True
     args.pretrained_model = None

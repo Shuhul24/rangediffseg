@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 import dataset
 import models
+from diffusion import GaussianDiffusion
 import utils
 import utils.tools as tools
 from option import Option
@@ -82,7 +83,8 @@ def build_rangedit_model(settings, pretrained_path=None):
         adapter_layers=settings.adapter_layers,
         adapter_channels=settings.adapter_channels,
         adapter_heads=settings.adapter_heads,
-        aux_heads=settings.aux_heads)
+        aux_heads=settings.aux_heads,
+        predict_noise=settings.diffusion_loss_weight > 0)
     return model
 
 
@@ -104,6 +106,14 @@ class Trainer(object):
 
         # Init data loaders
         self.train_loader, self.val_loader = self._initDataloader()
+
+        # Forward diffusion process. Only used when the diffusion loss is on.
+        self.diffusion = None
+        if self.settings.diffusion_loss_weight > 0:
+            self.diffusion = GaussianDiffusion(
+                num_timesteps=self.settings.diffusion_timesteps,
+                schedule=self.settings.diffusion_schedule)
+            self.diffusion._to(self.device)
 
         # Init criterion and optimizer
         self.criterion = self._initCriterion()
@@ -268,14 +278,33 @@ class Trainer(object):
             input_mask = input_mask.to(self.device) * input_label.ge(1).float()
 
             if mode == 'Train':
+                # Forward diffusion. A timestep is drawn per sample and the
+                # input is noised; the trunk is conditioned on that timestep
+                # through adaLN, which is what the conditioning pathway was
+                # designed for. `t_max` bounds the noise level so the
+                # segmentation head still has signal to work with.
+                model_in, timestep, true_noise = input_feature, None, None
+                if self.diffusion is not None:
+                    B = input_feature.shape[0]
+                    t_max = max(1, int(self.settings.diffusion_t_max_frac *
+                                       self.diffusion.T))
+                    timestep = torch.randint(0, t_max, (B,), device=self.device)
+                    true_noise = torch.randn_like(input_feature)
+                    model_in = self.diffusion.q_sample(
+                        input_feature, timestep, noise=true_noise)
+
                 with tools.autocast(enabled=self.fp16_scaler is not None):
-                    output = model(input_feature)
+                    output = model(model_in, timestep=timestep) \
+                        if self.diffusion is not None else model(model_in)
 
                     # The pyramid decoder returns auxiliary logits from its
-                    # intermediate stages while training; each contributes a
-                    # down-weighted copy of the same loss.
-                    aux_outputs = []
-                    if isinstance(output, (tuple, list)):
+                    # intermediate stages; the noise head returns epsilon-hat.
+                    aux_outputs, noise_pred = [], None
+                    if isinstance(output, dict):
+                        aux_outputs = output.get('aux', [])
+                        noise_pred = output.get('noise')
+                        output = output['logits']
+                    elif isinstance(output, (tuple, list)):
                         output, aux_outputs = output
 
                     output_softmax = F.softmax(output, dim=1)
@@ -286,6 +315,15 @@ class Trainer(object):
                         aux_loss, _, _ = self.compute_losses(
                             aux, F.softmax(aux, dim=1), input_label, input_mask)
                         total_loss = total_loss + self.settings.aux_weight * aux_loss
+
+                    # The diffusion objective DiT was designed for: predict the
+                    # noise that was added. Gradient from this term reaches the
+                    # same trunk as the segmentation gradient.
+                    loss_diff = torch.zeros((), device=self.device)
+                    if noise_pred is not None:
+                        loss_diff = F.mse_loss(noise_pred.float(), true_noise.float())
+                        total_loss = total_loss + \
+                            self.settings.diffusion_loss_weight * loss_diff
 
                 # Backward
                 self.optimizer.zero_grad()
@@ -569,9 +607,9 @@ class Experiment(object):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='RangeDiT training options')
-    parser.add_argument('config_path', type=str, nargs='?', default='config.yaml',
+    parser.add_argument('config_pos', type=str, nargs='?', default=None,
                         help='path of the config file, type: string')
-    parser.add_argument('--config', dest='config_path',
+    parser.add_argument('--config', dest='config_opt', type=str, default=None,
                         help='path of the config file (alias of the positional argument)')
     parser.add_argument('--data_root', type=str, default=None,
                         help='path to the SemanticKITTI root, type: string')
@@ -615,7 +653,11 @@ def parse_args():
     parser.add_argument('--test_split', action='store_true', help='run inference on the test split')
     parser.add_argument('--log_frequency', type=int, default=None, help='logging frequency')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
-    return parser.parse_args()
+    args = parser.parse_args()
+    # argparse applies the positional's default after the optional is parsed,
+    # so sharing a dest makes `--config X` silently resolve to the default.
+    args.config_path = args.config_opt or args.config_pos or 'config.yaml'
+    return args
 
 
 if __name__ == '__main__':

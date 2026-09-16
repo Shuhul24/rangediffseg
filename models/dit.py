@@ -434,10 +434,16 @@ class DiTEncoder(nn.Module):
     def get_grid_size(self, H, W):
         return self.patch_embed.get_grid_size(H, W)
 
-    def get_conditioning(self, x):
-        """Build the adaLN-Zero conditioning vector `c` for a batch of tokens."""
+    def get_conditioning(self, x, timestep=None):
+        """
+        Build the adaLN-Zero conditioning vector `c` for a batch of tokens.
+
+        `timestep` is the per-sample diffusion timestep. When it is None the
+        fixed `cond_timestep` buffer is used instead, which is the behaviour
+        for pure segmentation: one constant vector for every input.
+        """
         B = x.shape[0]
-        t = self.cond_timestep.expand(B)
+        t = self.cond_timestep.expand(B) if timestep is None else timestep.float()
         y = self.cond_label.expand(B)
         c = self.t_embedder(t) + self.y_embedder(y)
         if self.learnable_cond:
@@ -446,7 +452,7 @@ class DiTEncoder(nn.Module):
             c = c + self.context_proj(x.mean(dim=1))
         return c
 
-    def forward(self, im, return_features=False):
+    def forward(self, im, return_features=False, timestep=None):
         B, _, H, W = im.shape
 
         x, skip = self.patch_embed(im)                 # (B, N, D), stem skip features
@@ -459,7 +465,7 @@ class DiTEncoder(nn.Module):
 
         x = self.dropout(x + pos_embed)
 
-        c = self.get_conditioning(x)
+        c = self.get_conditioning(x, timestep)
 
         prior, prior_maps = None, None
         if self.adapter_layers:

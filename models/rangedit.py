@@ -35,16 +35,47 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+class NoiseHead(nn.Module):
+    """
+    Predicts the noise epsilon that was added to the input.
+
+    This is the counterpart of DiT's `final_layer.linear`, which we drop when
+    the trunk is used purely as a feature extractor. Restoring it is what makes
+    a diffusion loss well-posed: the model has something that predicts noise,
+    so an MSE against the true noise has a target. Tokens are projected back to
+    patch-shaped pixel blocks and unpatchified to the input resolution.
+    """
+
+    def __init__(self, d_model, patch_size, out_channels):
+        super().__init__()
+        self.ph, self.pw = patch_size
+        self.out_channels = out_channels
+        self.proj = nn.Linear(d_model, self.ph * self.pw * out_channels, bias=True)
+        # Zero-init, as DiT does for its output layer: the model starts by
+        # predicting zero noise and learns away from it.
+        nn.init.constant_(self.proj.weight, 0)
+        nn.init.constant_(self.proj.bias, 0)
+
+    def forward(self, x, grid_hw):
+        gh, gw = grid_hw
+        B, N, _ = x.shape
+        assert N == gh * gw, f'{N} tokens do not fit a {gh}x{gw} grid'
+        x = self.proj(x).view(B, gh, gw, self.ph, self.pw, self.out_channels)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        return x.view(B, self.out_channels, gh * self.ph, gw * self.pw)
+
+
 class DiTSegmenter(nn.Module):
     """DiT encoder + segmentation decoder, applied to a whole range image."""
 
-    def __init__(self, encoder, decoder, n_cls):
+    def __init__(self, encoder, decoder, n_cls, noise_head=None):
         super().__init__()
         self.n_cls = n_cls
         self.patch_size = encoder.patch_size
         self.patch_stride = encoder.patch_stride
         self.encoder = encoder
         self.decoder = decoder
+        self.noise_head = noise_head
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -53,12 +84,19 @@ class DiTSegmenter(nn.Module):
 
         return with_prefix('encoder.', self.encoder).union(with_prefix('decoder.', self.decoder))
 
-    def forward(self, im):
+    def forward(self, im, timestep=None):
         H_ori, W_ori = im.size(2), im.size(3)
         im = padding(im, self.patch_size)
         H, W = im.size(2), im.size(3)
 
-        x, skip, prior_maps = self.encoder(im, return_features=True)
+        x, skip, prior_maps = self.encoder(im, return_features=True, timestep=timestep)
+
+        # Both heads read the same token features, so a single backward pass
+        # sends gradient from both objectives through the whole trunk.
+        noise_pred = None
+        if self.noise_head is not None and self.training:
+            gh, gw = self.encoder.get_grid_size(H, W)
+            noise_pred = unpadding(self.noise_head(x, (gh, gw)), (H_ori, W_ori))
 
         if isinstance(self.decoder, DecoderPyramid):
             out = self.decoder(x, (H, W), skip, prior_maps=prior_maps)
@@ -75,9 +113,20 @@ class DiTSegmenter(nn.Module):
             return unpadding(t, (H_ori, W_ori))
 
         feats = _to_input_res(out)
-        if aux is None:
+
+        # Eval always returns a bare tensor, so sliding-window inference and
+        # every existing caller are unaffected. Training returns a dict when
+        # there is more than one output, which keeps the callers explicit
+        # instead of unpacking a variable-length tuple.
+        extras = {}
+        if aux is not None:
+            extras['aux'] = [_to_input_res(a) for a in aux if a is not None]
+        if noise_pred is not None:
+            extras['noise'] = noise_pred
+        if not extras:
             return feats
-        return feats, [_to_input_res(a) for a in aux if a is not None]
+        extras['logits'] = feats
+        return extras
 
 
 class RangeDiT(nn.Module):
@@ -111,6 +160,7 @@ class RangeDiT(nn.Module):
         adapter_channels=64,
         adapter_heads=8,
         aux_heads=True,
+        predict_noise=False,
     ):
         super().__init__()
 
@@ -178,7 +228,12 @@ class RangeDiT(nn.Module):
         else:
             raise ValueError(f'Unknown decoder: {decoder}')
 
-        self.rangedit = DiTSegmenter(encoder, seg_decoder, n_cls=n_cls)
+        noise_head = None
+        if predict_noise:
+            noise_head = NoiseHead(cfg['hidden_size'], tuple(new_patch_stride), in_channels)
+
+        self.rangedit = DiTSegmenter(encoder, seg_decoder, n_cls=n_cls,
+                                     noise_head=noise_head)
 
         # ---- Load the off-the-shelf DiT weights ----
         if pretrained_path is not None:
@@ -325,5 +380,5 @@ class RangeDiT(nn.Module):
                 + count_parameters(self.rangedit.encoder.fusion_norms))
         return stats
 
-    def forward(self, *args):
-        return self.rangedit(*args)
+    def forward(self, *args, **kwargs):
+        return self.rangedit(*args, **kwargs)

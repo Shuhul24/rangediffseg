@@ -87,8 +87,12 @@ model:
   # injectors and discarded), and adds auxiliary heads on the intermediate
   # stages. 'up_conv' is the original single-stage decoder.
   decoder:      pyramid
-  aux_heads:    true
-  aux_weight:   0.4
+  # Auxiliary heads are OFF: none of the reference range-view methods use deep
+  # supervision, and extra loss terms change the optimisation. The loss stays
+  # exactly RangeViT's -- multi-class focal + Lovasz-softmax -- so this run
+  # isolates the decoder architecture rather than the objective.
+  aux_heads:    false
+  aux_weight:   0.0
   skip_filters: 256                     # stem -> decoder skip connection (0 = off, else = D_h)
 
   # ---- adaLN-Zero conditioning of the DiT blocks ----
