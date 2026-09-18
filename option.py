@@ -107,11 +107,55 @@ class Option(object):
         self.log_frequency = t_cfg.get('log_frequency', 100)
         self.save_path = t_cfg.get('save_path', './log')
 
+        # ------------------- Model selection / new branch ----------------- #
+        # 'rangedit' keeps the existing pipeline exactly as it is.
+        self.model_type = m_cfg.get('model_type', 'rangedit')
+        # Range-view channel layout. 'rxyzi' is the historical default;
+        # rangeformer_dit_seg requires 'xyzri' = [x, y, z, range, intensity].
+        self.channel_order = ds_cfg.get('channel_order', 'rxyzi')
+
+        rf = self.config.get('rangeformer_dit', {}) or {}
+        self.rf_in_channels      = rf.get('input_channels', 5)
+        self.rf_rem_dims         = tuple(rf.get('rem_dims', [64, 128, 128]))
+        self.rf_encoder_dims     = tuple(rf.get('encoder_dims', [128, 256]))
+        self.rf_encoder_depths   = tuple(rf.get('encoder_depths', [2, 2]))
+        self.rf_encoder_heads    = tuple(rf.get('encoder_heads', [2, 4]))
+        self.rf_encoder_sr       = tuple(rf.get('encoder_sr_ratios', [8, 4]))
+        self.rf_circular         = rf.get('circular_padding', False)
+        self.rf_latent_downsample= rf.get('latent_downsample', 2)
+        self.rf_cond_dim         = rf.get('cond_dim', 256)
+        self.rf_sem_latent_dim   = rf.get('semantic_latent_dim', 256)
+        self.rf_dit_hidden       = rf.get('dit_hidden_dim', 256)
+        self.rf_dit_depth        = rf.get('dit_depth', 3)
+        self.rf_dit_heads        = rf.get('dit_heads', 8)
+        self.rf_dit_mlp_ratio    = rf.get('dit_mlp_ratio', 4.0)
+        self.rf_dit_dropout      = rf.get('dit_dropout', 0.0)
+        self.rf_cond_sr_ratio    = rf.get('cond_sr_ratio', 2)
+        self.rf_bottleneck_type  = rf.get('bottleneck_type', 'dit')
+        self.rf_use_diffusion    = rf.get('use_diffusion', True)
+        self.rf_decoder_dims     = tuple(rf.get('decoder_dims', [128, 128]))
+        self.rf_use_gated_skip   = rf.get('use_gated_skip', False)
+        self.rf_timesteps        = rf.get('diffusion_train_timesteps', 1000)
+        self.rf_schedule         = rf.get('diffusion_schedule', 'cosine')
+        self.rf_lambda_diff      = rf.get('lambda_diff', 1.0)
+        self.rf_lambda_coarse    = rf.get('lambda_coarse', 0.2)
+        self.rf_inference_steps  = rf.get('inference_steps', 3)
+        self.rf_inference_t_start= rf.get('inference_t_start', 200)
+        self.rf_s0_clamp         = rf.get('s0_clamp', 10.0)
+        self.rf_grad_checkpointing = rf.get('gradient_checkpointing', False)
+
+        # ------------------- Optimisation knobs (shared) ------------------ #
+        self.gradient_accumulation_steps = t_cfg.get('gradient_accumulation_steps', 1)
+        self.amp = t_cfg.get('amp', t_cfg.get('use_fp16', True))
+        self.gradient_clip = t_cfg.get('gradient_clip', 0.0)
+        self.world_size = int(os.environ.get('WORLD_SIZE', 1))
+
         # ---------------------------- Runtime ---------------------------- #
         self.checkpoint = t_cfg.get('checkpoint', None)
         self.finetune_from = t_cfg.get('finetune_from', None)
         self.finetune_strict = t_cfg.get('finetune_strict', True)
         self.val_only = False
+        self.debug_grad_flow = False
         self.test_split = False
         self.save_eval_results = False
 
@@ -125,6 +169,7 @@ class Option(object):
         """Command-line arguments override the YAML file when provided."""
         for name in ('data_root', 'save_path', 'id', 'num_workers', 'pretrained_model',
                      'checkpoint', 'finetune_from', 'log_frequency', 'seed', 'batch_size',
+                     'model_type', 'gradient_accumulation_steps',
                      'n_epochs', 'lr', 'warmup_epochs', 'val_frequency', 'cond_mode',
                      'wandb_project', 'wandb_entity', 'wandb_name', 'wandb_mode'):
             value = getattr(args, name, None)
@@ -132,7 +177,7 @@ class Option(object):
                 setattr(self, name, value)
 
         for name in ('val_only', 'test_split', 'save_eval_results', 'use_wandb',
-                     'unfreeze_attn', 'unfreeze_ffn'):
+                     'unfreeze_attn', 'unfreeze_ffn', 'debug_grad_flow'):
             if getattr(args, name, False):
                 setattr(self, name, True)
 
@@ -148,6 +193,16 @@ class Option(object):
             self.pretrained_model = None
 
     def _check_options(self):
+        if self.model_type == 'rangeformer_dit_seg':
+            assert self.channel_order == 'xyzri', (
+                "rangeformer_dit_seg expects dataset.channel_order: xyzri "
+                "([x, y, z, range, intensity]); got %r" % self.channel_order)
+            assert self.rf_in_channels == 5, 'the network input must have 5 channels'
+            assert self.rf_dit_hidden == self.rf_sem_latent_dim, (
+                'dit_hidden_dim must equal semantic_latent_dim: the DiT operates '
+                'directly on the semantic latent')
+        assert self.gradient_accumulation_steps >= 1
+
         for name in ('patch_size', 'patch_stride', 'image_size', 'window_size', 'window_stride'):
             value = getattr(self, name)
             assert isinstance(value, (list, tuple)) and len(value) == 2, \

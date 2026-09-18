@@ -9,13 +9,29 @@ via yaw/pitch angles, producing a dense H x W range image.
 import numpy as np
 
 
+# Channel layouts for `proj_feat`. 'rxyzi' is the original layout and stays the
+# default so existing models are bit-for-bit unaffected; 'xyzri' is what the
+# RangeFormer-DiT branch consumes.
+CHANNEL_ORDERS = {
+    'rxyzi': ('range', 'x', 'y', 'z', 'intensity'),
+    'xyzri': ('x', 'y', 'z', 'range', 'intensity'),
+}
+
+
 class RangeProjection:
-    def __init__(self, proj_h=64, proj_w=2048, fov_up=3.0, fov_down=-25.0):
+    def __init__(self, proj_h=64, proj_w=2048, fov_up=3.0, fov_down=-25.0,
+                 channel_order='rxyzi'):
         """
         Args:
             proj_h / proj_w : range image dimensions (64 x 2048 for SemanticKITTI)
             fov_up / fov_down: vertical field-of-view bounds in degrees
+            channel_order   : 'rxyzi' (default, unchanged) or 'xyzri'
         """
+        if channel_order not in CHANNEL_ORDERS:
+            raise ValueError(f'unknown channel_order {channel_order!r}; '
+                             f'expected one of {sorted(CHANNEL_ORDERS)}')
+        self.channel_order = channel_order
+        self.channel_names = CHANNEL_ORDERS[channel_order]
         self.H, self.W = proj_h, proj_w
         self.fov_down = np.deg2rad(fov_down)
         self.fov_v = np.deg2rad(fov_up) + abs(self.fov_down)
@@ -26,7 +42,9 @@ class RangeProjection:
             points: (N, 4) float32 array [x, y, z, intensity]
         Returns:
             proj_range : (H, W)    depth image (-1 for empty pixels)
-            proj_feat  : (H, W, 5) [range, x, y, z, intensity]
+            proj_feat  : (H, W, 5) channels in `self.channel_order`
+                         'rxyzi' -> [range, x, y, z, intensity]  (default)
+                         'xyzri' -> [x, y, z, range, intensity]
             proj_idx   : (H, W)    index of point occupying each pixel (-1 = empty)
             proj_mask  : (H, W)    bool, True for occupied pixels
             px, py     : (N,)      pixel each point was projected onto
@@ -52,8 +70,12 @@ class RangeProjection:
         proj_idx = np.full((H, W), -1, dtype=np.int32)
 
         proj_range[py[order], px[order]] = depth[order]
-        proj_feat[py[order], px[order], 0] = depth[order]
-        proj_feat[py[order], px[order], 1:4] = points[order, :3]
+        if self.channel_order == 'rxyzi':
+            proj_feat[py[order], px[order], 0] = depth[order]
+            proj_feat[py[order], px[order], 1:4] = points[order, :3]
+        else:                                   # 'xyzri': [x, y, z, range, intensity]
+            proj_feat[py[order], px[order], 0:3] = points[order, :3]
+            proj_feat[py[order], px[order], 3] = depth[order]
         proj_feat[py[order], px[order], 4] = points[order, 3]
         proj_idx[py[order], px[order]] = order
 

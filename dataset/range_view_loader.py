@@ -25,6 +25,11 @@ from .projection import RangeProjection
 DEFAULT_MEAN = [12.12, 10.88, 0.23, -1.04, 0.21]
 DEFAULT_STD = [12.32, 11.47, 6.91, 0.86, 0.16]
 
+# The same statistics permuted for the 'xyzri' layout, so both channel orders
+# normalise identically. Override via `dataset.img_mean` / `dataset.img_stds`.
+DEFAULT_MEAN_XYZRI = [DEFAULT_MEAN[i] for i in (1, 2, 3, 0, 4)]
+DEFAULT_STD_XYZRI = [DEFAULT_STD[i] for i in (1, 2, 3, 0, 4)]
+
 
 class RangeViewDataset(Dataset):
     def __init__(self, parser,
@@ -32,7 +37,7 @@ class RangeViewDataset(Dataset):
                  fov_up: float = 3.0, fov_down: float = -25.0,
                  image_size=None, is_train: bool = True, aug_cfg: dict = None,
                  return_points: bool = False,
-                 img_mean=None, img_stds=None):
+                 img_mean=None, img_stds=None, channel_order: str = 'rxyzi'):
         """
         Args:
             parser        : point-cloud parser yielding (points (N,4), labels (N,))
@@ -47,17 +52,24 @@ class RangeViewDataset(Dataset):
             img_mean/img_stds : per-channel normalisation statistics
         """
         self.parser = parser
-        self.projector = RangeProjection(proj_h, proj_w, fov_up, fov_down)
+        self.projector = RangeProjection(proj_h, proj_w, fov_up, fov_down,
+                                         channel_order=channel_order)
+        self.channel_order = channel_order
+        self.channel_names = self.projector.channel_names
         self.num_cls = parser.NUM_CLASSES
         self.augmentor = Augmentor(aug_cfg or {}) if is_train else None
         self.is_train = is_train
         self.image_size = tuple(image_size) if image_size is not None else None
         self.return_points = return_points
 
-        self.mean = np.array(img_mean if img_mean is not None else DEFAULT_MEAN,
+        d_mean = DEFAULT_MEAN if channel_order == 'rxyzi' else DEFAULT_MEAN_XYZRI
+        d_std = DEFAULT_STD if channel_order == 'rxyzi' else DEFAULT_STD_XYZRI
+        self.mean = np.array(img_mean if img_mean is not None else d_mean,
                              dtype=np.float32)
-        self.std = np.array(img_stds if img_stds is not None else DEFAULT_STD,
+        self.std = np.array(img_stds if img_stds is not None else d_std,
                             dtype=np.float32)
+        assert self.mean.shape == (5,) and self.std.shape == (5,), \
+            'the network input has exactly 5 channels'
 
         self.mapped_cls_name = parser.mapped_cls_name
         self.cls_freq = parser.cls_freq

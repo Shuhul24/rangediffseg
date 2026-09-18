@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import datetime
 import os
 import time
@@ -28,6 +29,39 @@ import utils.tools as tools
 from option import Option
 from utils.inference import sliding_window_inference
 from utils.tools import Recorder, eval_results
+
+
+def build_rangeformer_dit_model(settings):
+    """The new `rangeformer_dit_seg` branch. Existing models are untouched."""
+    from models.rangeformer_dit import RangeFormerDiTSeg
+    return RangeFormerDiTSeg(
+        in_channels=settings.rf_in_channels,
+        n_classes=settings.n_classes,
+        rem_dims=settings.rf_rem_dims,
+        encoder_dims=settings.rf_encoder_dims,
+        encoder_depths=settings.rf_encoder_depths,
+        encoder_heads=settings.rf_encoder_heads,
+        encoder_sr_ratios=settings.rf_encoder_sr,
+        circular_padding=settings.rf_circular,
+        latent_downsample=settings.rf_latent_downsample,
+        cond_dim=settings.rf_cond_dim,
+        semantic_latent_dim=settings.rf_sem_latent_dim,
+        dit_hidden_dim=settings.rf_dit_hidden,
+        dit_depth=settings.rf_dit_depth,
+        dit_heads=settings.rf_dit_heads,
+        dit_mlp_ratio=settings.rf_dit_mlp_ratio,
+        dit_dropout=settings.rf_dit_dropout,
+        cond_sr_ratio=settings.rf_cond_sr_ratio,
+        grad_checkpointing=settings.rf_grad_checkpointing,
+        bottleneck_type=settings.rf_bottleneck_type,
+        use_diffusion=settings.rf_use_diffusion,
+        decoder_dims=settings.rf_decoder_dims,
+        use_gated_skip=settings.rf_use_gated_skip,
+        diffusion_timesteps=settings.rf_timesteps,
+        diffusion_schedule=settings.rf_schedule,
+        inference_steps=settings.rf_inference_steps,
+        inference_t_start=settings.rf_inference_t_start,
+        s0_clamp=settings.rf_s0_clamp)
 
 
 def build_rangedit_model(settings, pretrained_path=None):
@@ -78,6 +112,11 @@ class Trainer(object):
             n_classes=self.settings.n_classes, device=torch.device('cpu'),
             ignore=self.ignore_class)
         self.metrics.reset()
+        # Coarse-head mIoU, so the DiT can be compared against its own anchor.
+        self.coarse_metrics = utils.metrics.IOUEval(
+            n_classes=self.settings.n_classes, device=torch.device('cpu'),
+            ignore=self.ignore_class)
+        self.coarse_metrics.reset()
 
         # Define scheduler (stepped once per iteration)
         self.scheduler = utils.scheduler.WarmupCosineLR(
@@ -86,6 +125,15 @@ class Trainer(object):
             warmup_steps=self.settings.warmup_epochs * len(self.train_loader),
             momentum=0.9,
             max_steps=len(self.train_loader) * (self.settings.n_epochs - self.settings.warmup_epochs))
+
+        self.is_rangeformer_dit = (settings.model_type == 'rangeformer_dit_seg')
+        self._trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self._micro_step = 0
+        self.global_step = 0
+        self._last_grad_norm = torch.zeros(())
+        self._last_parts = {}
+        self._t_hist = []
+        self._debug_grad_flow = getattr(settings, 'debug_grad_flow', False)
 
         # For mixed precision training
         self.fp16_scaler = None
@@ -110,7 +158,8 @@ class Trainer(object):
 
         common = dict(proj_h=settings.proj_h, proj_w=settings.proj_w,
                       fov_up=settings.fov_up, fov_down=settings.fov_down,
-                      img_mean=settings.img_mean, img_stds=settings.img_stds)
+                      img_mean=settings.img_mean, img_stds=settings.img_stds,
+                      channel_order=settings.channel_order)
 
         self.train_range_loader = dataset.RangeViewDataset(
             train_parser,
@@ -176,6 +225,72 @@ class Trainer(object):
             v.to(self.device)
         return criterion
 
+    # Modules that must receive gradient for the architecture to be alive.
+    _GRAD_PROBES = ('rem', 'stage1', 'stage2', 'latent_proj', 'coarse_head',
+                    'class_embed', 'dit', 'decoder')
+
+    def _report_grad_flow(self):
+        """Runs once when --debug-grad-flow is passed; then disables itself."""
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        print('--- gradient flow (one batch) ---', flush=True)
+        bad = []
+        for name in self._GRAD_PROBES:
+            mod = getattr(model, name, None)
+            if mod is None:
+                continue
+            gs = [p.grad for p in mod.parameters() if p.requires_grad and p.grad is not None]
+            if not gs:
+                print(f'  {name:<16} NO GRADIENT', flush=True); bad.append(name); continue
+            norm = torch.sqrt(sum((g.float() ** 2).sum() for g in gs))
+            finite = torch.isfinite(norm)
+            flag = '' if (finite and norm > 0) else '   <-- PROBLEM'
+            if not finite or norm == 0:
+                bad.append(name)
+            print(f'  {name:<16} grad_norm {norm.item():.6e}{flag}', flush=True)
+        if bad:
+            print(f'  WARNING: no finite non-zero gradient for: {bad}', flush=True)
+        else:
+            print('  all probed modules received finite non-zero gradients', flush=True)
+        print('---------------------------------', flush=True)
+
+    def compute_rf_losses(self, out, label, mask):
+        """
+        L_total = L_sem + lambda_diff * L_diff + lambda_coarse * L_coarse
+
+        L_sem    = CE(final_logits) + Lovasz(final_logits)
+        L_coarse = CE(coarse_logits) + Lovasz(coarse_logits), at latent resolution
+        L_diff   = MSE(eps_hat, eps)
+
+        Ignore index 0 is respected in every semantic term. The semantic losses
+        run in fp32: the focal/Lovasz path takes log() of a clamped probability
+        and sorts per-pixel errors, both of which are fragile in fp16.
+        """
+        s = self.settings
+        logits = out['logits'].float()
+        parts = {}
+
+        ce = F.cross_entropy(logits, label, ignore_index=0)
+        lov = self.criterion['lovasz'](F.softmax(logits, dim=1), label)
+        parts['ce'], parts['lovasz'] = ce, lov
+        total = ce + lov
+
+        if s.rf_lambda_coarse > 0:
+            h, w = out['latent_hw']
+            lab_small = F.interpolate(label.unsqueeze(1).float(), size=(h, w),
+                                      mode='nearest').squeeze(1).long()
+            cl = out['coarse_logits'].float()
+            c_ce = F.cross_entropy(cl, lab_small, ignore_index=0)
+            c_lov = self.criterion['lovasz'](F.softmax(cl, dim=1), lab_small)
+            parts['coarse'] = c_ce + c_lov
+            total = total + s.rf_lambda_coarse * parts['coarse']
+
+        if out.get('eps') is not None and s.rf_lambda_diff > 0:
+            parts['diff'] = F.mse_loss(out['eps_hat'].float(), out['eps'].float())
+            total = total + s.rf_lambda_diff * parts['diff']
+
+        parts['total'] = total
+        return total, parts
+
     def compute_losses(self, output, output_softmax, label, mask):
         loss_lovasz = self.criterion['lovasz'](output_softmax, label)
         loss_focal = self.criterion['focal_loss'](output_softmax, label, mask=mask)
@@ -195,6 +310,7 @@ class Trainer(object):
         # Init metrics
         loss_meter = tools.AverageMeter()
         self.metrics.reset()
+        self.coarse_metrics.reset()
         loss_lovasz = loss_focal = torch.zeros(1)
 
         total_iter = len(dataloader)
@@ -210,41 +326,103 @@ class Trainer(object):
             input_mask = input_mask.to(self.device) * input_label.ge(1).float()
 
             if mode == 'Train':
+                accum = self.settings.gradient_accumulation_steps
+                # zero_grad only at the start of an accumulation window
+                if self._micro_step % accum == 0:
+                    self.optimizer.zero_grad(set_to_none=True)
+
                 with tools.autocast(enabled=self.fp16_scaler is not None):
-                    output = self.model(input_feature)
-                    output_softmax = F.softmax(output, dim=1)
-                    total_loss, loss_lovasz, loss_focal = self.compute_losses(
-                        output, output_softmax, input_label, input_mask)
+                    if self.is_rangeformer_dit:
+                        out = self.model(input_feature, labels=input_label)
+                        output = out['logits']
+                        if out.get('timestep') is not None:
+                            self._t_hist = (self._t_hist +
+                                            out['timestep'].detach().cpu().tolist())[-2000:]
+                        total_loss, parts = self.compute_rf_losses(
+                            out, input_label, input_mask)
+                        loss_lovasz = parts.get('lovasz', torch.zeros((), device=self.device))
+                        loss_focal = parts.get('ce', torch.zeros((), device=self.device))
+                        self._last_parts = parts
+                    else:
+                        output = self.model(input_feature)
+                        output_softmax = F.softmax(output, dim=1)
+                        total_loss, loss_lovasz, loss_focal = self.compute_losses(
+                            output, output_softmax, input_label, input_mask)
 
-                # Backward
-                self.optimizer.zero_grad()
-                if self.fp16_scaler is None:
-                    total_loss.backward()
-                    self.optimizer.step()
-                else:
-                    self.fp16_scaler.scale(total_loss).backward()
-                    self.fp16_scaler.step(self.optimizer)
-                    self.fp16_scaler.update()
+                # Scale so the accumulated gradient matches a single large batch
+                scaled = total_loss / accum
+                is_last_micro = ((self._micro_step + 1) % accum == 0 or
+                                 i == total_iter - 1)
 
-                # Update lr after backward (required by pytorch)
-                self.scheduler.step()
+                # Skip the DDP all-reduce on non-final micro-steps when possible
+                sync_ctx = (self.model.no_sync()
+                            if (not is_last_micro and hasattr(self.model, 'no_sync'))
+                            else contextlib.nullcontext())
+                with sync_ctx:
+                    if self.fp16_scaler is None:
+                        scaled.backward()
+                    else:
+                        self.fp16_scaler.scale(scaled).backward()
+
+                if self._debug_grad_flow:
+                    self._report_grad_flow()
+                    self._debug_grad_flow = False
+
+                if is_last_micro:
+                    if self.fp16_scaler is not None:
+                        self.fp16_scaler.unscale_(self.optimizer)   # before clipping
+                    if self.settings.gradient_clip > 0:
+                        self._last_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self._trainable_params, self.settings.gradient_clip)
+                    if self.fp16_scaler is None:
+                        self.optimizer.step()
+                    else:
+                        self.fp16_scaler.step(self.optimizer)
+                        self.fp16_scaler.update()
+                    # scheduler and global step advance per OPTIMIZER UPDATE
+                    self.scheduler.step()
+                    self.global_step += 1
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                self._micro_step += 1
             else:
                 with torch.no_grad():
                     assert input_feature.shape[0] == 1, 'the validation batch size has to be 1'
 
-                    with tools.autocast(enabled=self.fp16_scaler is not None):
-                        lidar_pred = sliding_window_inference(
-                            self.model,
-                            input_feature,
-                            window_size=self.settings.window_size,
-                            window_stride=self.settings.window_stride,
-                            n_cls=self.settings.n_classes,
-                            batch_size=1)
+                    if self.is_rangeformer_dit:
+                        # No labels are passed: inference must never see GT.
+                        # Falls through to the shared metric/logging block below
+                        # so the new branch reports exactly like the existing one.
+                        m = self.model.module if hasattr(self.model, 'module') else self.model
+                        with tools.autocast(enabled=self.fp16_scaler is not None):
+                            inf = m.infer(input_feature)
+                        output = inf['logits']
+                        output_softmax = F.softmax(output, dim=1)
+                        total_loss, loss_lovasz, loss_focal = self.compute_losses(
+                            output, output_softmax, input_label, input_mask)
+                        # coarse mIoU alongside the final one: is the DiT beating
+                        # the anchor it was initialised from?
+                        with torch.no_grad():
+                            coarse_up = F.interpolate(
+                                inf['coarse_logits'].float(), size=input_label.shape[-2:],
+                                mode='bilinear', align_corners=False)
+                            self.coarse_metrics.addBatch(
+                                coarse_up.argmax(1).cpu(), input_label.cpu())
 
-                    output = lidar_pred.unsqueeze(0)     # [C, H, W] ==> [1, C, H, W]
-                    output_softmax = F.softmax(output, dim=1)
-                    total_loss, loss_lovasz, loss_focal = self.compute_losses(
-                        output, output_softmax, input_label, input_mask)
+                    else:
+                        with tools.autocast(enabled=self.fp16_scaler is not None):
+                            lidar_pred = sliding_window_inference(
+                                self.model,
+                                input_feature,
+                                window_size=self.settings.window_size,
+                                window_stride=self.settings.window_stride,
+                                n_cls=self.settings.n_classes,
+                                batch_size=1)
+
+                        output = lidar_pred.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
+                        output_softmax = F.softmax(output, dim=1)
+                        total_loss, loss_lovasz, loss_focal = self.compute_losses(
+                            output, output_softmax, input_label, input_mask)
 
             # Measure IoU and record loss
             loss = total_loss.mean()
@@ -277,13 +455,32 @@ class Trainer(object):
                         lr, loss.item(), mean_acc.item(), mean_iou.item())
                     log_str += 'RT {}'.format(remain_time)
                     self.recorder.logger.info(log_str)
-                    self.recorder.log_wandb({
+                    payload = {
                         f'{mode}/iter_loss': loss.item(),
                         f'{mode}/iter_mean_acc': mean_acc.item(),
                         f'{mode}/iter_mean_iou': mean_iou.item(),
                         'train/lr': lr,
                         'epoch': epoch + 1,
-                    })
+                    }
+                    if self.is_rangeformer_dit and mode == 'Train':
+                        # Individual terms, so the diffusion objective can be
+                        # read separately from the segmentation one.
+                        for k in ('ce', 'lovasz', 'coarse', 'diff'):
+                            if k in self._last_parts:
+                                payload[f'{mode}/loss_{k}'] = float(self._last_parts[k])
+                        payload['train/grad_norm'] = float(self._last_grad_norm)
+                        payload['train/micro_batch'] = input_feature.shape[0]
+                        payload['train/effective_batch'] = (
+                            input_feature.shape[0] *
+                            self.settings.gradient_accumulation_steps *
+                            self.settings.world_size)
+                        payload['train/global_step'] = self.global_step
+                        if torch.cuda.is_available():
+                            payload['train/gpu_mem_gb'] = (
+                                torch.cuda.max_memory_allocated() / 2 ** 30)
+                        if self._t_hist:
+                            payload['train/timestep_mean'] = float(np.mean(self._t_hist))
+                    self.recorder.log_wandb(payload)
 
         with torch.no_grad():
             mean_acc, class_acc = self.metrics.getAcc()
@@ -327,7 +524,7 @@ class Trainer(object):
                 self.recorder.tensorboard.add_scalar(f'{mode}/mean_iou', mean_iou.item(), epoch)
                 self.recorder.tensorboard.add_scalar(f'{mode}/mean_acc', mean_acc.item(), epoch)
 
-            self.recorder.log_wandb({
+            epoch_payload = {
                 f'{mode}/loss': loss_dict['loss_meter_avg'],
                 f'{mode}/loss_focal': loss_dict['loss_focal'],
                 f'{mode}/loss_lovasz': loss_dict['loss_lovasz'],
@@ -335,7 +532,23 @@ class Trainer(object):
                 f'{mode}/mean_acc': mean_acc.item(),
                 f'{mode}/mean_recall': mean_recall.item(),
                 'epoch': epoch + 1,
-            })
+            }
+            # Per-class IoU, and the coarse anchor the DiT has to beat.
+            for ci, ciou in enumerate(class_iou.tolist()):
+                if ci in self.ignore_class:
+                    continue
+                epoch_payload[f'{mode}/IoU_{self.mapped_cls_name[ci]}'] = ciou
+            if self.is_rangeformer_dit and mode == 'Validation':
+                c_miou, _ = self.coarse_metrics.getIoU()
+                epoch_payload[f'{mode}/coarse_mean_iou'] = c_miou.item()
+                epoch_payload[f'{mode}/final_minus_coarse'] = (
+                    mean_iou.item() - c_miou.item())
+                if self.recorder is not None:
+                    self.recorder.logger.info(
+                        f'>>> coarse mIoU {c_miou.item():.4f}  '
+                        f'final mIoU {mean_iou.item():.4f}  '
+                        f'diffusion gain {mean_iou.item() - c_miou.item():+.4f}')
+            self.recorder.log_wandb(epoch_payload)
 
         return {'mean_iou': mean_iou.item(), 'mean_acc': mean_acc.item()}
 
@@ -359,6 +572,15 @@ class Experiment(object):
         self._loadCheckpoint()
 
     def _initModel(self):
+        if self.settings.model_type == 'rangeformer_dit_seg':
+            model = build_rangeformer_dit_model(self.settings)
+            if self.recorder is not None:
+                stats = model.parameter_groups()
+                self.recorder.logger.info('RangeFormerDiTSeg parameters:')
+                for k, v in stats.items():
+                    self.recorder.logger.info(f'==> {k}: {v:,}')
+            return model
+
         model = build_rangedit_model(
             self.settings, pretrained_path=self.settings.pretrained_model)
 
@@ -419,6 +641,11 @@ class Experiment(object):
         }
         if self.trainer.fp16_scaler is not None:
             checkpoint_data['fp16_scaler'] = self.trainer.fp16_scaler.state_dict()
+        checkpoint_data['scheduler'] = self.trainer.scheduler.state_dict()
+        checkpoint_data['global_step'] = self.trainer.global_step
+        checkpoint_data['micro_step'] = self.trainer._micro_step
+        checkpoint_data['config'] = self.settings.config
+        checkpoint_data['model_type'] = self.settings.model_type
         if extra is not None:
             checkpoint_data.update(extra)
         torch.save(checkpoint_data, path)
@@ -511,6 +738,13 @@ def parse_args():
     parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/team')
     parser.add_argument('--wandb_name', type=str, default=None, help='Weights & Biases run name')
     parser.add_argument('--wandb_mode', type=str, default=None, help='Weights & Biases mode, e.g. online/offline')
+    parser.add_argument('--model_type', type=str, default=None,
+                        help="'rangedit' (default) or 'rangeformer_dit_seg'")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=None,
+                        help='micro-batches per optimizer update')
+    parser.add_argument('--debug-grad-flow', dest='debug_grad_flow',
+                        action='store_true',
+                        help='report per-module gradient norms for one batch, then stop')
     parser.add_argument('--val_only', action='store_true', help='run inference only')
     parser.add_argument('--test_split', action='store_true', help='run inference on the test split')
     parser.add_argument('--log_frequency', type=int, default=None, help='logging frequency')

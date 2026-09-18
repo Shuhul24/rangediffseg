@@ -1,0 +1,124 @@
+# ─────────────────────────────────────────────────────────────
+# RangeFormer + conditional semantic-latent DiT.
+#
+# Selected by `model.model_type: rangeformer_dit_seg`. The existing RangeDiT
+# pipeline is unaffected: it remains the default for every other config.
+#
+# Ablations (no model code changes needed):
+#   B  bottleneck_type: transformer,  use_diffusion: false
+#   C  bottleneck_type: dit,          use_diffusion: false
+#   D  bottleneck_type: dit,          use_diffusion: true     <- this file
+#   E  D + use_gated_skip: true
+# ─────────────────────────────────────────────────────────────
+
+dataset:
+  name:        SemanticKitti
+  root:        /path/to/SemanticKITTI
+  n_classes:   20                       # 19 semantic + ignore (index 0)
+  in_channels: 5
+  # REQUIRED for this model: [x, y, z, range, intensity].
+  channel_order: xyzri
+  proj_h:      64
+  proj_w:      2048
+  fov_up:      3.0
+  fov_down:    -25.0
+  train_seqs: ['00','01','02','03','04','05','06','07','09','10']
+  val_seqs:   ['08']
+  test_seqs:  ['11','12','13','14','15','16','17','18','19','20','21']
+
+  # Per-channel statistics in xyzri order. Leave null to use the defaults,
+  # which are the existing rxyzi statistics permuted to match.
+  img_mean: null
+  img_stds: null
+
+  augmentation:
+    p_flipx: 0.5
+    p_flipy: 0.5
+    p_transx: 0.5
+    transx_range: [-5.0, 5.0]
+    p_transy: 0.5
+    transy_range: [-3.0, 3.0]
+    p_transz: 0.5
+    transz_range: [-1.0, 0.0]
+    p_rot_yaw: 0.5
+    rot_yaw_range: [-5.0, 5.0]
+    p_rot_pitch: 0.5
+    rot_pitch_range: [-5.0, 5.0]
+    p_rot_roll: 0.5
+    rot_roll_range: [-5.0, 5.0]
+    p_scale: 0.5
+    scale_range: [0.95, 1.05]
+
+# ─────────────────────────────────────────────────────────────
+model:
+  model_type:  rangeformer_dit_seg
+  image_size:  [64, 384]               # random training crop
+  window_size:   [64, 384]
+  window_stride: [64, 256]
+
+# ─────────────────────────────────────────────────────────────
+rangeformer_dit:
+  input_channels: 5
+
+  # REM: shared per-pixel MLP, 5 -> 64 -> 128 -> 128, resolution preserved.
+  rem_dims: [64, 128, 128]
+
+  # Two encoder stages, each halving the resolution.
+  #   64x384 -> S1 32x192 (F1) -> S2 16x96 -> latent_proj 8x48 (C)
+  encoder_dims:      [128, 256]
+  encoder_depths:    [2, 2]
+  encoder_heads:     [2, 4]
+  encoder_sr_ratios: [8, 4]            # spatial-reduction attention, as in the reference
+  circular_padding:  false             # azimuth wrap; not in the reference, off by default
+
+  latent_downsample: 2                 # C at H/8 x W/8 so the DiT sees ~1-3k tokens
+  cond_dim:            256
+
+  # Semantic latent. Must equal dit_hidden_dim: the DiT denoises it directly.
+  semantic_latent_dim: 256
+
+  dit_hidden_dim: 256
+  dit_depth:      3
+  dit_heads:      8
+  dit_mlp_ratio:  4.0
+  dit_dropout:    0.0
+  cond_sr_ratio:  2                    # reduces the cross-attention key/value grid
+  gradient_checkpointing: false
+
+  bottleneck_type: dit                 # 'dit' | 'transformer'  (ablation B)
+  use_diffusion:   true                # false = ablation C
+
+  decoder_dims:   [128, 128]           # exactly two up stages
+  use_gated_skip: false                # true = ablation E
+
+  diffusion_train_timesteps: 1000
+  diffusion_schedule:        cosine
+  lambda_diff:   1.0
+  lambda_coarse: 0.2
+
+  # A handful of DDIM steps, not 50-1000.
+  inference_steps:   3
+  inference_t_start: 200
+  # clip_denoised bound on S0_hat; guards the 1/sqrt(alpha_bar) blow-up at large t
+  s0_clamp: 10.0
+
+# ─────────────────────────────────────────────────────────────
+training:
+  id:             rangeformer_dit_seg
+  n_epochs:       50
+  batch_size:     4                    # micro-batch, per GPU
+  gradient_accumulation_steps: 4       # effective = 4 * 4 * world_size
+  batch_size_val: 1
+  lr:             2.0e-4
+  weight_decay:   0.01
+  warmup_epochs:  2
+  amp:            true
+  use_fp16:       true
+  gradient_clip:  1.0
+  val_frequency:  5
+  train_result_frequency: 10
+  log_frequency:  100
+  num_workers:    4
+  save_path:      ./log
+  seed:           1
+  checkpoint:     null

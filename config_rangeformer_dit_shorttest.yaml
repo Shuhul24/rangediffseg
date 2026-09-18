@@ -1,0 +1,132 @@
+dataset:
+  name: SemanticKitti
+  root: /path/to/SemanticKITTI
+  n_classes: 20
+  in_channels: 5
+  channel_order: xyzri
+  proj_h: 64
+  proj_w: 2048
+  fov_up: 3.0
+  fov_down: -25.0
+  train_seqs:
+  - '04'
+  val_seqs:
+  - '04'
+  test_seqs:
+  - '11'
+  - '12'
+  - '13'
+  - '14'
+  - '15'
+  - '16'
+  - '17'
+  - '18'
+  - '19'
+  - '20'
+  - '21'
+  img_mean: null
+  img_stds: null
+  augmentation:
+    p_flipx: 0.5
+    p_flipy: 0.5
+    p_transx: 0.5
+    transx_range:
+    - -5.0
+    - 5.0
+    p_transy: 0.5
+    transy_range:
+    - -3.0
+    - 3.0
+    p_transz: 0.5
+    transz_range:
+    - -1.0
+    - 0.0
+    p_rot_yaw: 0.5
+    rot_yaw_range:
+    - -5.0
+    - 5.0
+    p_rot_pitch: 0.5
+    rot_pitch_range:
+    - -5.0
+    - 5.0
+    p_rot_roll: 0.5
+    rot_roll_range:
+    - -5.0
+    - 5.0
+    p_scale: 0.5
+    scale_range:
+    - 0.95
+    - 1.05
+model:
+  model_type: rangeformer_dit_seg
+  image_size:
+  - 64
+  - 384
+  window_size:
+  - 64
+  - 384
+  window_stride:
+  - 64
+  - 256
+rangeformer_dit:
+  input_channels: 5
+  rem_dims:
+  - 64
+  - 128
+  - 128
+  encoder_dims:
+  - 128
+  - 256
+  encoder_depths:
+  - 2
+  - 2
+  encoder_heads:
+  - 2
+  - 4
+  encoder_sr_ratios:
+  - 8
+  - 4
+  circular_padding: false
+  latent_downsample: 2
+  cond_dim: 256
+  semantic_latent_dim: 256
+  dit_hidden_dim: 256
+  dit_depth: 3
+  dit_heads: 8
+  dit_mlp_ratio: 4.0
+  dit_dropout: 0.0
+  cond_sr_ratio: 2
+  gradient_checkpointing: false
+  bottleneck_type: dit
+  use_diffusion: true
+  decoder_dims:
+  - 128
+  - 128
+  use_gated_skip: false
+  diffusion_train_timesteps: 1000
+  diffusion_schedule: cosine
+  lambda_diff: 1.0
+  lambda_coarse: 0.2
+  inference_steps: 3
+  inference_t_start: 200
+  # clip_denoised bound on S0_hat; guards the 1/sqrt(alpha_bar) blow-up at large t
+  s0_clamp: 10.0
+training:
+  id: rfdit_shorttest
+  n_epochs: 2
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  batch_size_val: 1
+  lr: 0.0002
+  weight_decay: 0.01
+  warmup_epochs: 2
+  amp: true
+  use_fp16: true
+  gradient_clip: 1.0
+  val_frequency: 1
+  train_result_frequency: 10
+  log_frequency: 10
+  num_workers: 8
+  save_path: ./log
+  seed: 1
+  checkpoint: null
