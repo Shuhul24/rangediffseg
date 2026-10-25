@@ -55,6 +55,20 @@ class SemanticDiffusionTests(unittest.TestCase):
             torch.testing.assert_close(a, restored.sample(self.x, self.valid, steps=3, seed=7))
             self.assertFalse(Path(str(path) + '.tmp').exists())
 
+    def test_prediction_noise_and_self_condition(self):
+        condition = self.model.encode(self.x, self.valid)
+        prior = torch.randn(2, 3, 16, 32)
+        with torch.no_grad():
+            first = self.model.denoise(prior, torch.ones(2), condition)
+            predicted_clean = self.model.codes(first.softmax(1)).detach()
+        t = torch.tensor([0.25, 0.75])
+        noisy = self.model.corrupt(predicted_clean, t, torch.randn_like(prior))
+        logits = self.model.denoise(noisy, t, condition, predicted_clean)
+        logits.square().mean().backward()
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertFalse(predicted_clean.requires_grad)
+        self.assertGreater(self.model.state.weight.grad.abs().sum().item(), 0)
+
     def test_empty_targets_and_point_metrics(self):
         logits = torch.randn(2, 3, 16, 32, requires_grad=True)
         loss = loss_fn(logits, torch.zeros(2, 16, 32, dtype=torch.long), self.valid, Lovasz_softmax(ignore=-1), 1.)

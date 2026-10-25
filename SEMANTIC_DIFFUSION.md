@@ -30,11 +30,12 @@ a learned semantic VAE are alternative future ablations, not mixed into this run
 ## Train
 
 ```bash
-sbatch scripts/run_semantic_diffusion.sh
+EXPECTED_COMMIT=$(git rev-parse HEAD) sbatch scripts/run_semantic_diffusion.sh
 # Small real-data GPU verification, including unit tests:
 SMOKE=1 sbatch --time=00:30:00 scripts/run_semantic_diffusion.sh
 ```
 
+Set EXPECTED_COMMIT at submission to fail safely if the checkout changes while queued.
 Each submission gets a unique scratch output directory. The default uses one GPU,
 100 epochs, microbatch 4 and accumulation 4 (effective batch 16), AdamW with a
 three-epoch warmup, BF16 when supported, and gradient clipping. The scheduler

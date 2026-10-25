@@ -11,6 +11,14 @@
 #SBATCH --output=/scratch/p24cs0005/exp/job_log/rangediffseg/semantic-dit-%j.out
 set -euo pipefail
 cd /csehome/p24cs0005/rangediffseg
+if [[ -n "${EXPECTED_COMMIT:-}" && "$(git rev-parse HEAD)" != "${EXPECTED_COMMIT}" ]]; then
+    echo "Checkout changed since submission; refusing to train a different revision." >&2
+    exit 2
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "Tracked code/config changes must be committed before training." >&2
+    exit 2
+fi
 module load gcc/11.4.0-gcc-12.3.0-73jjveq
 module load cuda/11.8.0-gcc-12.3.0-4pg4hmh
 source /csehome/p24cs0005/miniconda3/etc/profile.d/conda.sh
