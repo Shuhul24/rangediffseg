@@ -1,0 +1,48 @@
+seed: 17
+model:
+  classes: 19
+  dim: 256
+  depth: 6
+  heads: 8
+  patch: [2, 8]
+  code_scale: 0.5
+  mode: diffusion
+data:
+  root: /scratch/p24cs0005/kitti/dataset
+  height: 64
+  width: 2048
+  crop: [64, 384]
+  train_seqs: ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10']
+  val_seqs: ['08']
+  augmentation:
+    p_flipx: 0.5
+    p_flipy: 0.5
+    p_rot_yaw: 0.5
+    rot_yaw_range: [-5.0, 5.0]
+    p_scale: 0.5
+    scale_range: [0.95, 1.05]
+  range_augmentation:
+    p_range_mix: 0.9
+    range_mix_k: [2, 3, 4, 5, 6]
+    p_range_paste: 0.9
+    p_range_union: 0.2
+    range_union_ratio: 0.5
+    p_range_shift: 1.0
+training:
+  epochs: 100
+  batch_size: 4
+  accumulation: 4
+  workers: 8
+  lr: 0.0002
+  weight_decay: 0.01
+  warmup_epochs: 3
+  grad_clip: 1.0
+  lovasz_weight: 1.0
+  self_condition_probability: 0.5
+  prediction_noise_probability: 0.25
+  prediction_warmup_epochs: 3
+  val_every: 5
+  log_every: 25
+evaluation:
+  steps: 3
+  stride: 256
